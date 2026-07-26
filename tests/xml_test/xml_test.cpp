@@ -1524,4 +1524,130 @@ suite char_data_parsing = [] {
    };
 };
 
+suite struct_reading = [] {
+   "read_attributes_and_text"_test = [] {
+      xml_user u{};
+      const std::string xml = R"(<user id="7" role="admin">Alice</user>)";
+      const auto ec = glz::read_xml(u, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(u.id == 7);
+      expect(u.role == "admin");
+      expect(u.text == "Alice");
+   };
+
+   "read_child_elements"_test = [] {
+      xml_book b{};
+      const std::string xml = "<book><title>Dune</title><year>1965</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "Dune");
+      expect(b.year == 1965);
+   };
+
+   "read_nested_structs"_test = [] {
+      xml_nested n{};
+      const std::string xml = "<n><book><title>Dune</title><year>1965</year></book><note>classic</note></n>";
+      const auto ec = glz::read_xml(n, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(n.book.title == "Dune");
+      expect(n.book.year == 1965);
+      expect(n.note == "classic");
+   };
+
+   "read_skips_declaration_comments_and_pis"_test = [] {
+      xml_book b{};
+      const std::string xml =
+         "<?xml version=\"1.0\"?><!-- lead --><?pi x?>"
+         "<book><!-- inner --><title>Dune</title><?pi y?><year>1965</year></book><!-- trail -->";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "Dune");
+      expect(b.year == 1965);
+   };
+
+   "attribute_coerces_to_member_type"_test = [] {
+      // On the wire an attribute is always a string; it must coerce to int.
+      xml_user u{};
+      const auto ec = glz::read_xml(u, std::string{R"(<user id="42" role="r">t</user>)"});
+      expect(!ec);
+      expect(u.id == 42);
+   };
+
+   "root_name_is_not_enforced_on_read"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml(b, std::string{"<anything><title>T</title><year>1</year></anything>"});
+      expect(!ec) << "reading accepts any root element name";
+      expect(b.title == "T");
+   };
+
+   "self_closing_element_yields_empty"_test = [] {
+      xml_book b{.title = "preset", .year = 9};
+      const auto ec = glz::read_xml(b, std::string{"<book><title/><year>1</year></book>"});
+      expect(!ec);
+      expect(b.title == "");
+      expect(b.year == 1);
+   };
+
+   "unknown_keys_error_by_default"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml(b, std::string{"<book><title>T</title><nope>x</nope><year>1</year></book>"});
+      expect(bool(ec));
+      expect(ec == glz::error_code::unknown_key);
+   };
+
+   "unknown_keys_skipped_when_disabled"_test = [] {
+      xml_book b{};
+      const std::string xml =
+         "<book><title>T</title>"
+         "<nope><deep a=\"1\">text<inner/></deep></nope>"
+         "<year>1</year></book>";
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "T");
+      expect(b.year == 1) << "the skipper must consume the whole unknown subtree";
+   };
+
+   "missing_keys_tolerated_by_default"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml(b, std::string{"<book><title>T</title></book>"});
+      expect(!ec);
+      expect(b.title == "T");
+      expect(b.year == 0);
+   };
+
+   "missing_keys_error_when_enabled"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_missing_keys = true}>(
+         b, std::string{"<book><title>T</title></book>"});
+      expect(bool(ec));
+      expect(ec == glz::error_code::missing_key);
+   };
+
+   "wellformedness_violations_rejected"_test = [] {
+      xml_book b{};
+      for (std::string_view bad : {
+              "<book><title>T</title>", // unclosed root
+              "<book><title>T</year></book>", // mismatched tags
+              "<book></book><extra/>", // two roots
+              "", // empty document
+              "   ", // whitespace only
+              "<book><title>T</title></book>junk", // trailing content
+           }) {
+         const auto ec = glz::read_xml(b, std::string{bad});
+         expect(bool(ec)) << "must reject: " << bad;
+      }
+   };
+
+   "roundtrip_write_then_read"_test = [] {
+      const xml_nested original{.book = {.title = "Dune", .year = 1965}, .note = "classic"};
+      const auto xml = glz::write_xml(original, "n").value_or("<error>");
+      xml_nested parsed{};
+      const auto ec = glz::read_xml(parsed, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(parsed.book.title == original.book.title);
+      expect(parsed.book.year == original.book.year);
+      expect(parsed.note == original.note);
+   };
+};
+
 int main() {}
