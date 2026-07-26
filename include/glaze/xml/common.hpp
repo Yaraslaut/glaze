@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "glaze/core/buffer_traits.hpp"
 #include "glaze/core/context.hpp"
 #include "glaze/core/opts.hpp"
 #include "glaze/xml/opts.hpp"
@@ -291,12 +292,14 @@ namespace glz::xml
    namespace detail
    {
       // Grows the buffer and appends, matching the dump/append pattern used by
-      // the other Glaze writers.
+      // the other Glaze writers. Routes growth through ensure_space so bounded
+      // buffers (std::array, std::span) report buffer_overflow instead of
+      // being resized unconditionally, which does not compile for them.
       template <class B>
-      void append_raw(std::string_view s, B& b, auto& ix)
+      void append_raw(std::string_view s, is_context auto& ctx, B& b, auto& ix)
       {
-         if (ix + s.size() > b.size()) {
-            b.resize((std::max)(b.size() * 2, ix + s.size()));
+         if (!ensure_space(ctx, b, ix + s.size())) [[unlikely]] {
+            return;
          }
          std::memcpy(b.data() + ix, s.data(), s.size());
          ix += s.size();
@@ -306,21 +309,21 @@ namespace glz::xml
    // Escapes character data. '>' is escaped unconditionally, which is stricter
    // than required but guarantees ']]>' can never appear literally.
    template <class B>
-   void escape_text(std::string_view s, B& b, auto& ix)
+   void escape_text(std::string_view s, is_context auto& ctx, B& b, auto& ix)
    {
       for (const char c : s) {
          switch (c) {
          case '&':
-            detail::append_raw("&amp;", b, ix);
+            detail::append_raw("&amp;", ctx, b, ix);
             break;
          case '<':
-            detail::append_raw("&lt;", b, ix);
+            detail::append_raw("&lt;", ctx, b, ix);
             break;
          case '>':
-            detail::append_raw("&gt;", b, ix);
+            detail::append_raw("&gt;", ctx, b, ix);
             break;
          default:
-            detail::append_raw(std::string_view{&c, 1}, b, ix);
+            detail::append_raw(std::string_view{&c, 1}, ctx, b, ix);
             break;
          }
       }
@@ -330,33 +333,33 @@ namespace glz::xml
    // and the three whitespace characters, because attribute-value
    // normalization would otherwise turn them into spaces on re-read.
    template <class B>
-   void escape_attribute(std::string_view s, B& b, auto& ix)
+   void escape_attribute(std::string_view s, is_context auto& ctx, B& b, auto& ix)
    {
       for (const char c : s) {
          switch (c) {
          case '&':
-            detail::append_raw("&amp;", b, ix);
+            detail::append_raw("&amp;", ctx, b, ix);
             break;
          case '<':
-            detail::append_raw("&lt;", b, ix);
+            detail::append_raw("&lt;", ctx, b, ix);
             break;
          case '>':
-            detail::append_raw("&gt;", b, ix);
+            detail::append_raw("&gt;", ctx, b, ix);
             break;
          case '"':
-            detail::append_raw("&quot;", b, ix);
+            detail::append_raw("&quot;", ctx, b, ix);
             break;
          case '\t':
-            detail::append_raw("&#x9;", b, ix);
+            detail::append_raw("&#x9;", ctx, b, ix);
             break;
          case '\n':
-            detail::append_raw("&#xA;", b, ix);
+            detail::append_raw("&#xA;", ctx, b, ix);
             break;
          case '\r':
-            detail::append_raw("&#xD;", b, ix);
+            detail::append_raw("&#xD;", ctx, b, ix);
             break;
          default:
-            detail::append_raw(std::string_view{&c, 1}, b, ix);
+            detail::append_raw(std::string_view{&c, 1}, ctx, b, ix);
             break;
          }
       }

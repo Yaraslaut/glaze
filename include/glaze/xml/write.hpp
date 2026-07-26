@@ -11,13 +11,9 @@
 #include "glaze/core/opts.hpp"
 #include "glaze/core/reflect.hpp"
 #include "glaze/core/to.hpp"
-#include "glaze/core/wrappers.hpp"
 #include "glaze/core/write.hpp"
 #include "glaze/core/write_chars.hpp"
-#include "glaze/core/write_wrappers.hpp"
 #include "glaze/util/dump.hpp"
-#include "glaze/util/for_each.hpp"
-#include "glaze/util/itoa.hpp"
 #include "glaze/xml/common.hpp"
 
 namespace glz
@@ -37,10 +33,10 @@ namespace glz
    struct to<XML, T>
    {
       template <auto Opts, class B>
-      static void op(auto&& value, is_context auto&&, B&& b, auto&& ix)
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
       {
          // xs:boolean lexical space.
-         xml::detail::append_raw(value ? "true" : "false", b, ix);
+         xml::detail::append_raw(value ? "true" : "false", ctx, b, ix);
       }
    };
 
@@ -77,14 +73,14 @@ namespace glz
    struct to<XML, T>
    {
       template <auto Opts, class B>
-      static void op(auto&& value, is_context auto&&, B&& b, auto&& ix)
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
       {
          const std::string_view sv{value};
          if constexpr (xml::check_attribute_pass(Opts)) {
-            xml::escape_attribute(sv, b, ix);
+            xml::escape_attribute(sv, ctx, b, ix);
          }
          else {
-            xml::escape_text(sv, b, ix);
+            xml::escape_text(sv, ctx, b, ix);
          }
       }
    };
@@ -99,7 +95,7 @@ namespace glz
       {
          const sv str = get_enum_name(value);
          if (!str.empty()) {
-            xml::detail::append_raw(str, b, ix);
+            xml::detail::append_raw(str, ctx, b, ix);
          }
          else [[unlikely]] {
             // Value doesn't have a mapped name, serialize as underlying number.
@@ -157,21 +153,24 @@ namespace glz
       size_t ix = 0;
 
       if constexpr (xml::check_write_declaration(Opts)) {
-         xml::detail::append_raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>", buffer, ix);
+         xml::detail::append_raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>", ctx, buffer, ix);
       }
 
-      xml::detail::append_raw("<", buffer, ix);
-      xml::detail::append_raw(name, buffer, ix);
-      xml::detail::append_raw(">", buffer, ix);
+      xml::detail::append_raw("<", ctx, buffer, ix);
+      xml::detail::append_raw(name, ctx, buffer, ix);
+      xml::detail::append_raw(">", ctx, buffer, ix);
 
       serialize<XML>::op<set_xml<Opts>()>(std::forward<T>(value), ctx, buffer, ix);
 
-      xml::detail::append_raw("</", buffer, ix);
-      xml::detail::append_raw(name, buffer, ix);
-      xml::detail::append_raw(">", buffer, ix);
+      xml::detail::append_raw("</", ctx, buffer, ix);
+      xml::detail::append_raw(name, ctx, buffer, ix);
+      xml::detail::append_raw(">", ctx, buffer, ix);
 
-      buffer.resize(ix);
-      return error_ctx{ix, ctx.error};
+      if (bool(ctx.error)) [[unlikely]] {
+         return error_ctx{ix, ctx.error, ctx.custom_error_message};
+      }
+      buffer_traits<std::remove_cvref_t<Buffer>>::finalize(buffer, ix);
+      return error_ctx{ix, error_code::none, ctx.custom_error_message};
    }
 
    template <auto Opts = xml::xml_opts{}, class T>

@@ -3,6 +3,7 @@
 
 #include "glaze/xml.hpp"
 
+#include <array>
 #include <cmath>
 #include <concepts>
 #include <cstdint>
@@ -315,7 +316,8 @@ suite entities_and_escaping = [] {
       auto esc = [](std::string_view s) {
          std::string b;
          size_t ix = 0;
-         glz::xml::escape_text(s, b, ix);
+         glz::xml::xml_context ctx{};
+         glz::xml::escape_text(s, ctx, b, ix);
          b.resize(ix);
          return b;
       };
@@ -335,7 +337,8 @@ suite entities_and_escaping = [] {
       auto esc = [](std::string_view s) {
          std::string b;
          size_t ix = 0;
-         glz::xml::escape_attribute(s, b, ix);
+         glz::xml::xml_context ctx{};
+         glz::xml::escape_attribute(s, ctx, b, ix);
          b.resize(ix);
          return b;
       };
@@ -356,7 +359,8 @@ suite entities_and_escaping = [] {
       for (std::string_view s : {"a&b", "a<b", "a]]>b", "\"q\"", "é€"}) {
          std::string b;
          size_t ix = 0;
-         glz::xml::escape_text(s, b, ix);
+         glz::xml::xml_context ctx{};
+         glz::xml::escape_text(s, ctx, b, ix);
          b.resize(ix);
          const auto [ok, decoded] = decode_all(b);
          expect(ok) << "failed to decode escaped form of " << s;
@@ -526,6 +530,40 @@ suite scalar_writing = [] {
    "write_declaration_default_on"_test = [] {
       const auto s = glz::write_xml(42).value_or("<error>");
       expect(s == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root>42</root>") << s;
+   };
+
+   "write_xml_accepts_non_resizable_buffers"_test = [] {
+      // write_xml advertises the output_buffer concept, which admits
+      // std::array. Calling .resize() unconditionally broke that contract and
+      // failed to compile for every sibling-format-compatible buffer type.
+      // 512 bytes gives the integer writer's scratch-space headroom (see
+      // write_padding_bytes) room to work, matching the convention used by
+      // the other formats' bounded-buffer tests (e.g. csv_bounded_buffer_test.cpp).
+      std::array<char, 512> arr{};
+      const auto ec = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(42, arr);
+      expect(!ec) << "std::array buffer must be supported";
+      expect(std::string_view{arr.data(), ec.count} == "<root>42</root>");
+
+      // A buffer too small to hold the output must report overflow, not
+      // truncate silently or write out of bounds.
+      std::array<char, 4> tiny{};
+      const auto ec2 = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(42, tiny);
+      expect(bool(ec2)) << "undersized buffer must error";
+   };
+
+   "invalid_root_name_is_rejected_before_writing"_test = [] {
+      // A name that is not a valid XML Name must be an error, never malformed
+      // output -- Glaze must not emit a document it would itself reject.
+      for (const std::string_view bad : {"1bad", "-x", "a b", "a/b", "", "@id", "#text"}) {
+         const auto r = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(42, bad);
+         expect(!r.has_value()) << "must reject root name: " << bad;
+         if (!r.has_value()) {
+            expect(r.error() == glz::error_code::syntax_error);
+         }
+      }
+      // Valid names still work, including one with a namespace prefix.
+      expect(glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(42, "ns:doc").value_or("") ==
+             "<ns:doc>42</ns:doc>");
    };
 };
 
