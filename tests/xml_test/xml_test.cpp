@@ -1293,6 +1293,29 @@ suite document_scanner = [] {
       expect(prolog("<?xml version=\"1.0\"?>\n<!-- c -->\n<?pi?>\n<a/>").first);
       expect(prolog("<a/>").second == size_t(0)); // prolog may be empty
    };
+
+   "declaration_is_only_valid_at_offset_zero"_test = [] {
+      // The XML declaration must be the very first thing in the document.
+      // This currently holds because a later "<?xml" falls through to parse_pi,
+      // whose reserved-target check rejects the target "xml" -- an incidental
+      // interaction, not an explicit guard. Pin it: a refactor that made
+      // parse_prolog call parse_xml_declaration wherever it sees "<?xml" would
+      // otherwise silently start accepting misplaced declarations.
+      auto prolog = [](std::string_view s) {
+         return scan([](auto& it, auto e, auto& c) { return glz::xml::parse_prolog(it, e, c); }, s);
+      };
+
+      // Accepted: declaration first, or no declaration at all.
+      expect(prolog(R"(<?xml version="1.0"?><a/>)").first);
+      expect(prolog(R"(<!-- c --><a/>)").first);
+      expect(prolog(R"(<?xml version="1.0"?><!-- c --><?pi d?><a/>)").first);
+
+      // Rejected: anything at all before the declaration.
+      expect(!prolog(R"(<!-- c --><?xml version="1.0"?><a/>)").first) << "declaration after a comment";
+      expect(!prolog(R"(<?pi x?><?xml version="1.0"?><a/>)").first) << "declaration after a PI";
+      expect(!prolog(" <?xml version=\"1.0\"?><a/>").first) << "declaration after a space";
+      expect(!prolog("\n<?xml version=\"1.0\"?><a/>").first) << "declaration after a newline";
+   };
 };
 
 int main() {}
