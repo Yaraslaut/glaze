@@ -1527,6 +1527,17 @@ suite scalar_writing = [] {
       expect(write_scalar(-2.25) == "<root>-2.25</root>");
    };
 
+   "write_special_floats_use_xsd_lexical_space"_test = [] {
+      // XSD 1.0 spells these "NaN", "INF", "-INF" for xs:float / xs:double.
+      // Emitting JSON's "null" here would collapse three distinct values and
+      // produce documents that fail the xs:double schema generated in Phase 5.
+      expect(write_scalar(std::numeric_limits<double>::quiet_NaN()) == "<root>NaN</root>");
+      expect(write_scalar(std::numeric_limits<double>::infinity()) == "<root>INF</root>");
+      expect(write_scalar(-std::numeric_limits<double>::infinity()) == "<root>-INF</root>");
+      expect(write_scalar(std::numeric_limits<float>::quiet_NaN()) == "<root>NaN</root>");
+      expect(write_scalar(-std::numeric_limits<float>::infinity()) == "<root>-INF</root>");
+   };
+
    "write_strings_are_escaped"_test = [] {
       expect(write_scalar(std::string{"hello"}) == "<root>hello</root>");
       expect(write_scalar(std::string{"a&b"}) == "<root>a&amp;b</root>");
@@ -1609,8 +1620,26 @@ namespace glz
       template <auto Opts, class B>
       static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
       {
-         // Reuse Glaze's shared number formatting so XML matches JSON exactly.
-         to<JSON, std::remove_cvref_t<decltype(value)>>::template op<set_json<Opts>()>(value, ctx, b, ix);
+         if (!ensure_space(ctx, b, ix + 32 + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         // XSD 1.0 lexical space for xs:float / xs:double spells the special
+         // values "NaN", "INF" and "-INF". Do NOT delegate to to<JSON, T> here:
+         // JSON has no NaN/Inf, so it emits "null" -- which in XML is just the
+         // literal text "null", collapses three distinct values into one, and
+         // makes a document fail the xs:double schema we generate for it in
+         // Phase 5. Use the shared write_chars, as every sibling format does.
+         if constexpr (std::floating_point<std::remove_cvref_t<T>>) {
+            if (std::isnan(value)) {
+               dump("NaN", b, ix);
+               return;
+            }
+            if (std::isinf(value)) {
+               dump(value < 0 ? "-INF" : "INF", b, ix);
+               return;
+            }
+         }
+         write_chars::op<Opts>(value, ctx, b, ix);
       }
    };
 
