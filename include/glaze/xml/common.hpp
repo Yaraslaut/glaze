@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <string>
 #include <string_view>
 
 #include "glaze/xml/opts.hpp"
@@ -153,5 +155,202 @@ namespace glz::xml
    constexpr bool validate_ncname(std::string_view s) noexcept
    {
       return validate_name(s) && s.find(':') == std::string_view::npos;
+   }
+
+   // Encodes one scalar as UTF-8. Returns bytes written, or 0 if cp is not a
+   // character XML permits.
+   constexpr size_t encode_utf8(char32_t cp, char* out) noexcept
+   {
+      if (!is_xml_char(cp)) return 0;
+
+      if (cp < 0x80) {
+         out[0] = static_cast<char>(cp);
+         return 1;
+      }
+      if (cp < 0x800) {
+         out[0] = static_cast<char>(0xC0 | (cp >> 6));
+         out[1] = static_cast<char>(0x80 | (cp & 0x3F));
+         return 2;
+      }
+      if (cp < 0x10000) {
+         out[0] = static_cast<char>(0xE0 | (cp >> 12));
+         out[1] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+         out[2] = static_cast<char>(0x80 | (cp & 0x3F));
+         return 3;
+      }
+      out[0] = static_cast<char>(0xF0 | (cp >> 18));
+      out[1] = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+      out[2] = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+      out[3] = static_cast<char>(0x80 | (cp & 0x3F));
+      return 4;
+   }
+
+   // Decodes a reference beginning at '*it'. On success advances it past the
+   // terminating ';' and appends the replacement text to out.
+   //
+   // Only the five predefined entities and numeric character references are
+   // recognised. Any other general entity is undeclared as far as this parser
+   // is concerned (we skip rather than expand the internal DTD subset), and is
+   // rejected rather than silently passed through.
+   inline bool decode_reference(const char*& it, const char* end, std::string& out) noexcept
+   {
+      if (it >= end || *it != '&') return false;
+
+      const char* p = it + 1;
+      if (p >= end) return false;
+
+      if (*p == '#') {
+         ++p;
+         if (p >= end) return false;
+
+         int base = 10;
+         if (*p == 'x' || *p == 'X') {
+            base = 16;
+            ++p;
+         }
+
+         const char* digits_begin = p;
+         uint64_t cp = 0;
+         constexpr uint64_t overflow_guard = 0x110000; // clamp; anything above is invalid anyway
+
+         while (p < end && *p != ';') {
+            uint64_t d;
+            const char c = *p;
+            if (c >= '0' && c <= '9') {
+               d = uint64_t(c - '0');
+            }
+            else if (base == 16 && c >= 'a' && c <= 'f') {
+               d = uint64_t(c - 'a' + 10);
+            }
+            else if (base == 16 && c >= 'A' && c <= 'F') {
+               d = uint64_t(c - 'A' + 10);
+            }
+            else {
+               return false; // non-digit inside the reference
+            }
+            // Saturate instead of wrapping so huge inputs stay invalid.
+            if (cp <= overflow_guard) {
+               cp = cp * uint64_t(base) + d;
+            }
+            ++p;
+         }
+
+         if (p >= end || p == digits_begin) return false; // no ';' or no digits
+
+         char buf[4]{};
+         const size_t n = cp > overflow_guard ? 0 : encode_utf8(char32_t(cp), buf);
+         if (n == 0) return false; // not a legal XML character
+
+         out.append(buf, n);
+         it = p + 1;
+         return true;
+      }
+
+      // Named entity: read up to ';'.
+      const char* name_begin = p;
+      while (p < end && *p != ';') {
+         ++p;
+      }
+      if (p >= end) return false; // unterminated
+
+      const std::string_view name{name_begin, size_t(p - name_begin)};
+
+      char replacement = '\0';
+      if (name == "amp") {
+         replacement = '&';
+      }
+      else if (name == "lt") {
+         replacement = '<';
+      }
+      else if (name == "gt") {
+         replacement = '>';
+      }
+      else if (name == "quot") {
+         replacement = '"';
+      }
+      else if (name == "apos") {
+         replacement = '\'';
+      }
+      else {
+         return false; // undeclared general entity
+      }
+
+      out.push_back(replacement);
+      it = p + 1;
+      return true;
+   }
+
+   namespace detail
+   {
+      // Grows the buffer and appends, matching the dump/append pattern used by
+      // the other Glaze writers.
+      template <class B>
+      void append_raw(std::string_view s, B& b, auto& ix)
+      {
+         if (ix + s.size() > b.size()) {
+            b.resize((std::max)(b.size() * 2, ix + s.size()));
+         }
+         std::memcpy(b.data() + ix, s.data(), s.size());
+         ix += s.size();
+      }
+   }
+
+   // Escapes character data. '>' is escaped unconditionally, which is stricter
+   // than required but guarantees ']]>' can never appear literally.
+   template <class B>
+   void escape_text(std::string_view s, B& b, auto& ix)
+   {
+      for (const char c : s) {
+         switch (c) {
+         case '&':
+            detail::append_raw("&amp;", b, ix);
+            break;
+         case '<':
+            detail::append_raw("&lt;", b, ix);
+            break;
+         case '>':
+            detail::append_raw("&gt;", b, ix);
+            break;
+         default:
+            detail::append_raw(std::string_view{&c, 1}, b, ix);
+            break;
+         }
+      }
+   }
+
+   // Escapes an attribute value. Additionally escapes '"' (the quote we emit)
+   // and the three whitespace characters, because attribute-value
+   // normalization would otherwise turn them into spaces on re-read.
+   template <class B>
+   void escape_attribute(std::string_view s, B& b, auto& ix)
+   {
+      for (const char c : s) {
+         switch (c) {
+         case '&':
+            detail::append_raw("&amp;", b, ix);
+            break;
+         case '<':
+            detail::append_raw("&lt;", b, ix);
+            break;
+         case '>':
+            detail::append_raw("&gt;", b, ix);
+            break;
+         case '"':
+            detail::append_raw("&quot;", b, ix);
+            break;
+         case '\t':
+            detail::append_raw("&#x9;", b, ix);
+            break;
+         case '\n':
+            detail::append_raw("&#xA;", b, ix);
+            break;
+         case '\r':
+            detail::append_raw("&#xD;", b, ix);
+            break;
+         default:
+            detail::append_raw(std::string_view{&c, 1}, b, ix);
+            break;
+         }
+      }
    }
 }

@@ -4,6 +4,7 @@
 #include "glaze/xml.hpp"
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -222,6 +223,134 @@ suite name_classification = [] {
       static_assert(glz::xml::validate_name("book"));
       static_assert(!glz::xml::validate_name("1a"));
       expect(true);
+   };
+};
+
+suite entities_and_escaping = [] {
+   auto decode_all = [](std::string_view s) -> std::pair<bool, std::string> {
+      std::string out;
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      while (it < end) {
+         if (*it == '&') {
+            if (!glz::xml::decode_reference(it, end, out)) return {false, out};
+         }
+         else {
+            out.push_back(*it++);
+         }
+      }
+      return {true, out};
+   };
+
+   "predefined_entities"_test = [decode_all] {
+      expect(decode_all("&amp;") == std::pair{true, std::string{"&"}});
+      expect(decode_all("&lt;") == std::pair{true, std::string{"<"}});
+      expect(decode_all("&gt;") == std::pair{true, std::string{">"}});
+      expect(decode_all("&quot;") == std::pair{true, std::string{"\""}});
+      expect(decode_all("&apos;") == std::pair{true, std::string{"'"}});
+      expect(decode_all("a&amp;b") == std::pair{true, std::string{"a&b"}});
+      expect(decode_all("&lt;&gt;") == std::pair{true, std::string{"<>"}});
+   };
+
+   "numeric_character_references"_test = [decode_all] {
+      expect(decode_all("&#65;") == std::pair{true, std::string{"A"}});
+      expect(decode_all("&#x41;") == std::pair{true, std::string{"A"}});
+      expect(decode_all("&#X41;") == std::pair{true, std::string{"A"}});
+      expect(decode_all("&#233;") == std::pair{true, std::string{"\xC3\xA9"}});
+      expect(decode_all("&#x20AC;") == std::pair{true, std::string{"\xE2\x82\xAC"}});
+      expect(decode_all("&#128512;") == std::pair{true, std::string{"\xF0\x9F\x98\x80"}});
+      expect(decode_all("&#x9;") == std::pair{true, std::string{"\t"}});
+   };
+
+   "rejected_references"_test = [decode_all] {
+      // Undeclared general entity — we do not expand the internal DTD subset.
+      expect(decode_all("&foo;").first == false);
+      // Malformed syntax.
+      expect(decode_all("&").first == false);
+      expect(decode_all("&amp").first == false); // missing ';'
+      expect(decode_all("&;").first == false); // empty name
+      expect(decode_all("&#;").first == false); // empty number
+      expect(decode_all("&#x;").first == false);
+      expect(decode_all("&#zz;").first == false);
+      expect(decode_all("&#1a;").first == false);
+      // Code points that are not legal XML characters.
+      expect(decode_all("&#0;").first == false); // NUL
+      expect(decode_all("&#xB;").first == false); // vertical tab
+      expect(decode_all("&#xD800;").first == false); // surrogate
+      expect(decode_all("&#xDFFF;").first == false); // surrogate
+      expect(decode_all("&#xFFFE;").first == false); // noncharacter
+      expect(decode_all("&#xFFFF;").first == false); // noncharacter
+      expect(decode_all("&#x110000;").first == false); // out of range
+      // Overflow must not wrap into a valid code point.
+      expect(decode_all("&#99999999999999999999;").first == false);
+      expect(decode_all("&#xFFFFFFFFFFFFFFFF;").first == false);
+   };
+
+   "encode_utf8"_test = [] {
+      auto enc = [](char32_t cp) {
+         char buf[4]{};
+         const auto n = glz::xml::encode_utf8(cp, buf);
+         return std::string{buf, n};
+      };
+      expect(enc(U'A') == "A");
+      expect(enc(U'é') == "\xC3\xA9");
+      expect(enc(U'€') == "\xE2\x82\xAC");
+      expect(enc(U'\U0001F600') == "\xF0\x9F\x98\x80");
+      expect(enc(char32_t(0xD800)).empty());
+      expect(enc(char32_t(0x110000)).empty());
+   };
+
+   "escape_text"_test = [] {
+      auto esc = [](std::string_view s) {
+         std::string b;
+         size_t ix = 0;
+         glz::xml::escape_text(s, b, ix);
+         b.resize(ix);
+         return b;
+      };
+      expect(esc("plain") == "plain");
+      expect(esc("a&b") == "a&amp;b");
+      expect(esc("a<b") == "a&lt;b");
+      expect(esc("a>b") == "a&gt;b");
+      // Quotes need no escaping in text content.
+      expect(esc("say \"hi\"") == "say \"hi\"");
+      expect(esc("'") == "'");
+      // ']]>' must never appear literally in character data.
+      expect(esc("a]]>b") == "a]]&gt;b");
+      expect(esc("") == "");
+   };
+
+   "escape_attribute"_test = [] {
+      auto esc = [](std::string_view s) {
+         std::string b;
+         size_t ix = 0;
+         glz::xml::escape_attribute(s, b, ix);
+         b.resize(ix);
+         return b;
+      };
+      expect(esc("plain") == "plain");
+      expect(esc("a&b") == "a&amp;b");
+      expect(esc("a<b") == "a&lt;b");
+      expect(esc("a>b") == "a&gt;b");
+      expect(esc("say \"hi\"") == "say &quot;hi&quot;");
+      // Whitespace must survive attribute-value normalization on re-read,
+      // so it is written as character references rather than literally.
+      expect(esc("a\tb") == "a&#x9;b");
+      expect(esc("a\nb") == "a&#xA;b");
+      expect(esc("a\rb") == "a&#xD;b");
+      expect(esc(" keep spaces ") == " keep spaces ");
+   };
+
+   "escape_roundtrip"_test = [decode_all] {
+      for (std::string_view s : {"a&b", "a<b", "a]]>b", "\"q\"", "é€"}) {
+         std::string b;
+         size_t ix = 0;
+         glz::xml::escape_text(s, b, ix);
+         b.resize(ix);
+         const auto [ok, decoded] = decode_all(b);
+         expect(ok) << "failed to decode escaped form of " << s;
+         expect(decoded == std::string{s}) << "roundtrip mismatch for " << s;
+      }
    };
 };
 
