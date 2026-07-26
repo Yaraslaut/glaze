@@ -295,28 +295,26 @@ namespace glz
 
 namespace glz
 {
-   // Sequence writer for positions that are not a struct member (so no
-   // enclosing key is available to repeat as the sibling tag name): a nested
-   // sequence inside another sequence, or the mapped value of a
-   // writable_map_t entry. Without a name to repeat, this only writes each
-   // item's body content back to back with no tags of its own -- the named,
-   // repeated-sibling form the format actually wants is produced by the
-   // object writer's member loop above, which special-cases sequence members
-   // and calls xml::detail::write_sequence directly instead of going through
-   // this specialization.
+   // A sequence reached with no enclosing member key to name its items: a
+   // sequence inside a sequence, or a map's mapped value. XML has no way to
+   // name these items, and the repeated-sibling convention this format uses
+   // takes the element name from the enclosing struct member key.
+   //
+   // Writing the item bodies back to back would be well-formed XML but would
+   // silently fuse the items: vector<vector<int>>{{1,2},{3,4}} becomes
+   // <m>12</m><m>34</m>, and repeated objects fuse into one element with no
+   // separator, unrecoverable on read-back. Erroring is the honest behavior
+   // until a nested-container convention is specified.
    template <class T>
       requires(writable_array_t<T>)
    struct to<XML, T>
    {
       template <auto Opts, class B>
-      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      static void op(auto&&, is_context auto&& ctx, B&&, auto&&)
       {
-         for (auto&& item : value) {
-            if (bool(ctx.error)) [[unlikely]] {
-               return;
-            }
-            serialize<XML>::op<Opts>(item, ctx, b, ix);
-         }
+         ctx.error = error_code::syntax_error;
+         ctx.custom_error_message =
+            "a nested sequence has no element name; wrap it in a struct member so its items can be named";
       }
    };
 

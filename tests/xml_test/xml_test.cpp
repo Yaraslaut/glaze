@@ -825,4 +825,44 @@ suite container_writing = [] {
    };
 };
 
+struct nested_seq_holder
+{
+   std::vector<std::vector<int>> m{};
+};
+
+template <>
+struct glz::meta<nested_seq_holder>
+{
+   using T = nested_seq_holder;
+   static constexpr auto value = object("m", &T::m);
+};
+
+suite nested_container_rejection = [] {
+   "nested_sequence_is_rejected_not_silently_fused"_test = [] {
+      // Writing the bodies back to back is well-formed XML but fuses the items:
+      // {{1,2},{3,4}} would become <m>12</m><m>34</m>, unrecoverable on read.
+      // XML has no name for the inner items, so this must error.
+      const nested_seq_holder h{.m = {{1, 2}, {3, 4}}};
+      const auto r = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "s");
+      expect(!r.has_value()) << "nested sequence must error, not silently fuse items";
+      if (!r.has_value()) {
+         expect(r.error() == glz::error_code::syntax_error);
+      }
+   };
+
+   "map_of_sequences_is_rejected"_test = [] {
+      const std::map<std::string, std::vector<int>> m{{"a", {1, 2, 3}}};
+      const auto r = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(m, "m");
+      expect(!r.has_value()) << "map-of-sequence must error, not fuse into <a>123</a>";
+   };
+
+   "single_level_sequences_still_work"_test = [] {
+      // Regression guard: the named-item path through an object member is
+      // unaffected and must keep working.
+      const xml_shelf s{.name = "a", .tag = {1, 2, 3}};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(s, "shelf").value_or("<error>");
+      expect(out == "<shelf><name>a</name><tag>1</tag><tag>2</tag><tag>3</tag></shelf>") << out;
+   };
+};
+
 int main() {}
