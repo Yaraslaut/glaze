@@ -488,6 +488,27 @@ suite name_classification = [] {
       expect(glz::xml::is_name_start_char(char32_t(0x10000)));
       expect(glz::xml::is_name_start_char(char32_t(0xEFFFF)));
       expect(!glz::xml::is_name_start_char(char32_t(0xF0000))); // above the final range
+      // Upper edges and the four ranges an edges-only set would otherwise miss.
+      // Without these, a transposed hex digit in any of them passes every other
+      // assertion in this suite.
+      expect(!glz::xml::is_name_start_char(char32_t(0x1FFF + 1)));
+      expect(glz::xml::is_name_start_char(char32_t(0x1FFF)));
+      expect(!glz::xml::is_name_start_char(char32_t(0x206F)));
+      expect(glz::xml::is_name_start_char(char32_t(0x2070)));
+      expect(glz::xml::is_name_start_char(char32_t(0x218F)));
+      expect(!glz::xml::is_name_start_char(char32_t(0x2190)));
+      expect(!glz::xml::is_name_start_char(char32_t(0x2BFF)));
+      expect(glz::xml::is_name_start_char(char32_t(0x2C00)));
+      expect(glz::xml::is_name_start_char(char32_t(0x2FEF)));
+      expect(!glz::xml::is_name_start_char(char32_t(0x2FF0)));
+      expect(!glz::xml::is_name_start_char(char32_t(0xF8FF)));
+      expect(glz::xml::is_name_start_char(char32_t(0xF900)));
+      expect(glz::xml::is_name_start_char(char32_t(0xFDCF)));
+      expect(!glz::xml::is_name_start_char(char32_t(0xFDD0)));
+      expect(!glz::xml::is_name_start_char(char32_t(0xFDEF)));
+      expect(glz::xml::is_name_start_char(char32_t(0xFDF0)));
+      expect(glz::xml::is_name_start_char(char32_t(0xFFFD)));
+      expect(!glz::xml::is_name_start_char(char32_t(0xFFFE)));
    };
 
    "name_char_extra_ranges"_test = [] {
