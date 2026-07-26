@@ -863,6 +863,17 @@ suite nested_container_rejection = [] {
       const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(s, "shelf").value_or("<error>");
       expect(out == "<shelf><name>a</name><tag>1</tag><tag>2</tag><tag>3</tag></shelf>") << out;
    };
+
+   "failed_serialization_does_not_close_the_tag"_test = [] {
+      // A tag whose body failed to serialize must not be closed: <m></m> would
+      // be indistinguishable from a legitimately empty element. Mirrors the
+      // JSON writer's guard (json/write.hpp:200,314,436).
+      const nested_seq_holder h{.m = {{1, 2}, {3, 4}}};
+      std::string buffer;
+      const auto ec = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, buffer, "s");
+      expect(bool(ec)) << "nested sequence must still error";
+      expect(!buffer.starts_with("<s><m></m></s>")) << "must not emit a well-formed but bogus element: " << buffer;
+   };
 };
 
 int main() {}

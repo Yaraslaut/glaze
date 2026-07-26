@@ -164,9 +164,15 @@ namespace glz::xml::detail
          serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
       }
 
-      append_raw("</", ctx, b, ix);
-      append_raw(name, ctx, b, ix);
-      append_raw(">", ctx, b, ix);
+      // Mirror the JSON writer (json/write.hpp:200,314,436): don't close a tag
+      // whose body failed to serialize. Emitting </name> anyway leaves a
+      // syntactically valid but semantically bogus element in the caller's
+      // buffer, indistinguishable from a legitimately empty one.
+      if (not bool(ctx.error)) [[likely]] {
+         append_raw("</", ctx, b, ix);
+         append_raw(name, ctx, b, ix);
+         append_raw(">", ctx, b, ix);
+      }
    }
 
    // Writes a sequence as repeated sibling elements -- <name>item</name> for
@@ -262,7 +268,13 @@ namespace glz
             }
          });
 
-         xml::detail::append_raw(">", ctx, b, ix);
+         // Same guard as write_wrapped_element's closing tag: if an attribute
+         // in pass 1 failed to serialize, don't close the start tag either --
+         // an unterminated tag is an honest failure signature, whereas a
+         // closed-but-error'd tag can look like a legitimately empty element.
+         if (not bool(ctx.error)) [[likely]] {
+            xml::detail::append_raw(">", ctx, b, ix);
+         }
 
          // Pass 2: text content, then child elements.
          for_each<N>([&]<size_t I>() {
