@@ -10,7 +10,10 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
+#include "glaze/core/context.hpp"
+#include "glaze/core/opts.hpp"
 #include "glaze/xml/opts.hpp"
 
 namespace glz::xml
@@ -358,4 +361,89 @@ namespace glz::xml
          }
       }
    }
+
+   struct ns_binding final
+   {
+      std::string prefix{};
+      std::string uri{};
+   };
+
+   struct xml_context : context
+   {
+      // Names of currently open elements, outermost first. Owned copies,
+      // because the input buffer may not outlive parsing in the streaming case.
+      std::vector<std::string> element_stack{};
+
+      // Flat stack of prefix bindings paired with scope markers. ns_scope_marks
+      // records the size of ns_bindings when each scope was opened, so closing a
+      // scope is a single truncation.
+      std::vector<ns_binding> ns_bindings{};
+      std::vector<size_t> ns_scope_marks{};
+
+      size_t depth() const noexcept { return element_stack.size(); }
+
+      std::string_view current_element() const noexcept
+      {
+         return element_stack.empty() ? std::string_view{} : std::string_view{element_stack.back()};
+      }
+
+      bool push_element(std::string_view name) noexcept
+      {
+         if (element_stack.size() >= max_recursive_depth_limit) [[unlikely]] {
+            error = error_code::exceeded_max_recursive_depth;
+            return false;
+         }
+         element_stack.emplace_back(name);
+         return true;
+      }
+
+      bool pop_element(std::string_view name) noexcept
+      {
+         if (element_stack.empty()) [[unlikely]] {
+            error = error_code::syntax_error;
+            return false;
+         }
+         if (element_stack.back() != name) [[unlikely]] {
+            error = error_code::syntax_error;
+            return false;
+         }
+         element_stack.pop_back();
+         return true;
+      }
+
+      void push_ns_scope() noexcept { ns_scope_marks.push_back(ns_bindings.size()); }
+
+      void pop_ns_scope() noexcept
+      {
+         if (ns_scope_marks.empty()) return;
+         ns_bindings.resize(ns_scope_marks.back());
+         ns_scope_marks.pop_back();
+      }
+
+      bool bind_prefix(std::string_view prefix, std::string_view uri) noexcept
+      {
+         ns_bindings.emplace_back(ns_binding{std::string{prefix}, std::string{uri}});
+         return true;
+      }
+
+      // Innermost binding wins, so the search runs back to front.
+      std::string_view resolve_prefix(std::string_view prefix) const noexcept
+      {
+         for (auto it = ns_bindings.rbegin(); it != ns_bindings.rend(); ++it) {
+            if (it->prefix == prefix) {
+               return it->uri;
+            }
+         }
+         return {};
+      }
+   };
+}
+
+namespace glz
+{
+   template <>
+   struct format_context<XML>
+   {
+      using type = xml::xml_context;
+   };
 }

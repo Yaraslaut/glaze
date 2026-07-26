@@ -3,6 +3,7 @@
 
 #include "glaze/xml.hpp"
 
+#include <concepts>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -359,6 +360,91 @@ suite entities_and_escaping = [] {
          expect(ok) << "failed to decode escaped form of " << s;
          expect(decoded == std::string{s}) << "roundtrip mismatch for " << s;
       }
+   };
+};
+
+suite xml_context_tests = [] {
+   "element_stack_nesting"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(ctx.depth() == size_t(0));
+      expect(ctx.push_element("root"));
+      expect(ctx.depth() == size_t(1));
+      expect(ctx.current_element() == "root");
+      expect(ctx.push_element("child"));
+      expect(ctx.current_element() == "child");
+      expect(ctx.pop_element("child"));
+      expect(ctx.current_element() == "root");
+      expect(ctx.pop_element("root"));
+      expect(ctx.depth() == size_t(0));
+   };
+
+   "element_stack_mismatch_rejected"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(ctx.push_element("a"));
+      expect(ctx.push_element("b"));
+      // </a> while <b> is open is the classic well-formedness violation.
+      expect(!ctx.pop_element("a"));
+   };
+
+   "pop_on_empty_stack_rejected"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(!ctx.pop_element("a"));
+   };
+
+   "depth_limit_enforced"_test = [] {
+      glz::xml::xml_context ctx{};
+      bool hit_limit = false;
+      for (size_t i = 0; i < glz::max_recursive_depth_limit + 2; ++i) {
+         if (!ctx.push_element("e")) {
+            hit_limit = true;
+            break;
+         }
+      }
+      expect(hit_limit) << "deeply nested input must be rejected, not overflow";
+      expect(ctx.error == glz::error_code::exceeded_max_recursive_depth);
+   };
+
+   "namespace_scoping"_test = [] {
+      glz::xml::xml_context ctx{};
+      ctx.push_ns_scope();
+      expect(ctx.bind_prefix("a", "urn:a"));
+      expect(ctx.resolve_prefix("a") == "urn:a");
+
+      ctx.push_ns_scope();
+      expect(ctx.bind_prefix("b", "urn:b"));
+      // Outer binding still visible from the inner scope.
+      expect(ctx.resolve_prefix("a") == "urn:a");
+      expect(ctx.resolve_prefix("b") == "urn:b");
+
+      ctx.pop_ns_scope();
+      // Inner binding gone once its scope closes.
+      expect(ctx.resolve_prefix("b").empty());
+      expect(ctx.resolve_prefix("a") == "urn:a");
+
+      ctx.pop_ns_scope();
+      expect(ctx.resolve_prefix("a").empty());
+   };
+
+   "namespace_shadowing"_test = [] {
+      glz::xml::xml_context ctx{};
+      ctx.push_ns_scope();
+      expect(ctx.bind_prefix("p", "urn:outer"));
+      ctx.push_ns_scope();
+      expect(ctx.bind_prefix("p", "urn:inner"));
+      expect(ctx.resolve_prefix("p") == "urn:inner");
+      ctx.pop_ns_scope();
+      expect(ctx.resolve_prefix("p") == "urn:outer");
+   };
+
+   "unbound_prefix_resolves_empty"_test = [] {
+      glz::xml::xml_context ctx{};
+      ctx.push_ns_scope();
+      expect(ctx.resolve_prefix("nope").empty());
+   };
+
+   "format_context_specialized"_test = [] {
+      static_assert(std::same_as<glz::format_context_t<glz::XML>, glz::xml::xml_context>);
+      expect(true);
    };
 };
 
