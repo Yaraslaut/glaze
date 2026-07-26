@@ -1456,6 +1456,14 @@ namespace glz
       ret.format = YAML;
       return ret;
    }
+
+   template <auto Opts>
+   constexpr auto set_xml()
+   {
+      auto ret = Opts;
+      ret.format = XML;
+      return ret;
+   }
 }
 
 namespace glz

@@ -50,6 +50,7 @@ struct glz::meta<glz::error_code>
                                     "key_not_found",
                                     "unknown_key",
                                     "missing_key",
+                                    "duplicate_key",
                                     "invalid_flag_input",
                                     "invalid_escape",
                                     "u_requires_hex_digits",
@@ -120,6 +121,7 @@ struct glz::meta<glz::error_code>
                                      key_not_found, //
                                      unknown_key, //
                                      missing_key, //
+                                     duplicate_key, //
                                      // Other errors
                                      invalid_flag_input, //
                                      invalid_escape, //

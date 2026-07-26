@@ -55,6 +55,7 @@ namespace glz
       key_not_found, //
       unknown_key, //
       missing_key, //
+      duplicate_key, // A key or attribute appeared more than once where only one is allowed
       // Other errors
       invalid_flag_input, //
       invalid_escape, //

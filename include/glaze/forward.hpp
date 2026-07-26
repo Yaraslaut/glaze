@@ -38,6 +38,7 @@ namespace glz
    inline constexpr std::uint32_t NDJSON = 100; // new line delimited JSON
    inline constexpr std::uint32_t TOML = 400;
    inline constexpr std::uint32_t YAML = 450;
+   inline constexpr std::uint32_t XML = 460;
    inline constexpr std::uint32_t STENCIL = 500;
    inline constexpr std::uint32_t MUSTACHE = 501;
    inline constexpr std::uint32_t CSV = 10000;
