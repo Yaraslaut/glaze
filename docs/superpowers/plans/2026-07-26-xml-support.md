@@ -394,6 +394,7 @@ Expected: every pre-existing test still passes.
 
 ```bash
 git add include/glaze/forward.hpp include/glaze/core/opts.hpp include/glaze/core/context.hpp \
+        include/glaze/core/error_category.hpp \
         include/glaze/xml.hpp include/glaze/xml/opts.hpp \
         tests/xml_test/ tests/CMakeLists.txt
 git commit -m "feat(xml): register XML format id and scaffold test target"
