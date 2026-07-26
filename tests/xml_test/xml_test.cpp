@@ -567,4 +567,99 @@ suite scalar_writing = [] {
    };
 };
 
+struct xml_user
+{
+   int id{};
+   std::string role{};
+   std::string text{};
+};
+
+template <>
+struct glz::meta<xml_user>
+{
+   using T = xml_user;
+   static constexpr auto value = object("@id", &T::id, "@role", &T::role, "#text", &T::text);
+   static constexpr std::string_view root_name = "user";
+};
+
+struct xml_book
+{
+   std::string title{};
+   int year{};
+};
+
+template <>
+struct glz::meta<xml_book>
+{
+   using T = xml_book;
+   static constexpr auto value = object("title", &T::title, "year", &T::year);
+};
+
+struct xml_nested
+{
+   xml_book book{};
+   std::string note{};
+};
+
+template <>
+struct glz::meta<xml_nested>
+{
+   using T = xml_nested;
+   static constexpr auto value = object("book", &T::book, "note", &T::note);
+};
+
+suite object_writing = [] {
+   "attributes_and_text"_test = [] {
+      const xml_user u{.id = 7, .role = "admin", .text = "Alice"};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(u).value_or("<error>");
+      // root_name comes from glz::meta, so the tag is <user>, not <root>.
+      expect(s == "<user id=\"7\" role=\"admin\">Alice</user>") << s;
+   };
+
+   "child_elements"_test = [] {
+      const xml_book b{.title = "Dune", .year = 1965};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(b, "book").value_or("<error>");
+      expect(s == "<book><title>Dune</title><year>1965</year></book>") << s;
+   };
+
+   "nested_structs"_test = [] {
+      const xml_nested n{.book = {.title = "Dune", .year = 1965}, .note = "classic"};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(n, "n").value_or("<error>");
+      expect(s == "<n><book><title>Dune</title><year>1965</year></book><note>classic</note></n>") << s;
+   };
+
+   "attribute_values_are_attribute_escaped"_test = [] {
+      const xml_user u{.id = 1, .role = "a\"b&c", .text = "x<y"};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(u).value_or("<error>");
+      expect(s == "<user id=\"1\" role=\"a&quot;b&amp;c\">x&lt;y</user>") << s;
+   };
+
+   "runtime_root_name_overrides_default_but_not_meta"_test = [] {
+      const xml_book b{.title = "T", .year = 1};
+      const auto s1 = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(b, "custom").value_or("<error>");
+      expect(s1.starts_with("<custom>")) << s1;
+
+      // glz::meta<xml_user>::root_name wins over the runtime argument.
+      const xml_user u{.id = 1, .role = "r", .text = "t"};
+      const auto s2 = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(u, "ignored").value_or("<error>");
+      expect(s2.starts_with("<user ")) << s2;
+   };
+
+   "invalid_root_name_is_rejected"_test = [] {
+      const auto r = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(42, "1bad");
+      expect(!r.has_value());
+      expect(r.error() == glz::error_code::syntax_error);
+   };
+
+   "sigil_helpers"_test = [] {
+      static_assert(glz::xml::is_attribute_key("@id"));
+      static_assert(!glz::xml::is_attribute_key("id"));
+      static_assert(glz::xml::is_text_key("#text"));
+      static_assert(!glz::xml::is_text_key("#other"));
+      static_assert(glz::xml::strip_sigil("@id") == "id");
+      static_assert(glz::xml::strip_sigil("id") == "id");
+      expect(true);
+   };
+};
+
 int main() {}

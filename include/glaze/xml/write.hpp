@@ -5,15 +5,19 @@
 
 #include <cmath>
 #include <concepts>
+#include <string_view>
+#include <utility>
 
 #include "glaze/core/buffer_traits.hpp"
 #include "glaze/core/chrono.hpp"
+#include "glaze/core/common.hpp"
 #include "glaze/core/opts.hpp"
 #include "glaze/core/reflect.hpp"
 #include "glaze/core/to.hpp"
 #include "glaze/core/write.hpp"
 #include "glaze/core/write_chars.hpp"
 #include "glaze/util/dump.hpp"
+#include "glaze/util/for_each.hpp"
 #include "glaze/xml/common.hpp"
 
 namespace glz
@@ -118,6 +122,132 @@ namespace glz
    };
 }
 
+namespace glz::xml::detail
+{
+   // Writes `<name ...attrs>body</name>` for a single element and is the ONLY
+   // place that emits an element's start/end tags. Both write_xml (for the
+   // document root) and the reflected-object writer's element pass (for every
+   // child) call this, so a given tag can never be written twice.
+   //
+   // Attributes must land inside the start tag, before '>', so the two shapes
+   // diverge on when '>' is written:
+   //  - Objects (glaze_object_t / reflectable) close their own start tag: their
+   //    to<XML, T>::op writes the attribute pass, then '>', then the body. This
+   //    function only supplies the outer <name> / </name> wrapper.
+   //  - Everything else (scalars, enums, ...) has no attributes, so this
+   //    function writes '>' itself immediately after the name and the value's
+   //    to<XML, T>::op only ever produces body text.
+   template <auto Opts, class T>
+   void write_wrapped_element(std::string_view name, T&& value, is_context auto& ctx, auto& b, auto& ix)
+   {
+      using V = std::remove_cvref_t<T>;
+
+      append_raw("<", ctx, b, ix);
+      append_raw(name, ctx, b, ix);
+
+      if constexpr (glaze_object_t<V> || reflectable<V>) {
+         serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
+      }
+      else {
+         append_raw(">", ctx, b, ix);
+         serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
+      }
+
+      append_raw("</", ctx, b, ix);
+      append_raw(name, ctx, b, ix);
+      append_raw(">", ctx, b, ix);
+   }
+}
+
+namespace glz
+{
+   // Reflected object writer: partitions members by key sigil into attributes
+   // ("@name"), text content ("#text"), and child elements (everything else).
+   // Attributes must appear inside the start tag, so the member loop runs
+   // twice -- once to emit attributes and close the start tag, once to emit
+   // the text/element body. This function does NOT write the <name>/</name>
+   // wrapper itself; xml::detail::write_wrapped_element owns that, so it can
+   // be reused unchanged for both the document root and nested elements.
+   template <class T>
+      requires((glaze_object_t<T> || reflectable<T>) && !custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class V, class B>
+      static void op(V&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         static constexpr auto N = reflect<T>::size;
+
+         decltype(auto) t = [&]() -> decltype(auto) {
+            if constexpr (reflectable<T>) {
+               return to_tie(value);
+            }
+            else {
+               return nullptr;
+            }
+         }();
+
+         auto member = [&]<size_t I>() -> decltype(auto) {
+            if constexpr (reflectable<T>) {
+               return get_member(value, get<I>(t));
+            }
+            else {
+               return get_member(value, get<I>(reflect<T>::values));
+            }
+         };
+
+         // Pass 1: attributes, then close the start tag. Non-sigil (element)
+         // keys are validated here too -- they're compile-time constants, so
+         // this is a static_assert rather than a runtime branch.
+         for_each<N>([&]<size_t I>() {
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            static constexpr auto key = glz::get<I>(reflect<T>::keys);
+
+            if constexpr (xml::is_attribute_key(key)) {
+               if (skip_member<Opts>(member.template operator()<I>())) {
+                  return;
+               }
+               static constexpr auto attr_name = xml::strip_sigil(key);
+               xml::detail::append_raw(" ", ctx, b, ix);
+               xml::detail::append_raw(attr_name, ctx, b, ix);
+               xml::detail::append_raw("=\"", ctx, b, ix);
+               serialize<XML>::op<xml::attribute_pass_on<Opts>()>(member.template operator()<I>(), ctx, b, ix);
+               xml::detail::append_raw("\"", ctx, b, ix);
+            }
+            else if constexpr (xml::is_text_key(key)) {
+               // Handled in pass 2.
+            }
+            else {
+               if constexpr (xml::check_validate_names(Opts)) {
+                  static_assert(xml::validate_name(key), "XML element key is not a valid XML Name");
+               }
+            }
+         });
+
+         xml::detail::append_raw(">", ctx, b, ix);
+
+         // Pass 2: text content, then child elements.
+         for_each<N>([&]<size_t I>() {
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            static constexpr auto key = glz::get<I>(reflect<T>::keys);
+
+            if constexpr (xml::is_attribute_key(key)) {
+               // Handled in pass 1.
+            }
+            else if constexpr (xml::is_text_key(key)) {
+               serialize<XML>::op<xml::attribute_pass_off<Opts>()>(member.template operator()<I>(), ctx, b, ix);
+            }
+            else {
+               xml::detail::write_wrapped_element<Opts>(key, member.template operator()<I>(), ctx, b, ix);
+            }
+         });
+      }
+   };
+}
+
 namespace glz
 {
    namespace xml
@@ -156,15 +286,11 @@ namespace glz
          xml::detail::append_raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>", ctx, buffer, ix);
       }
 
-      xml::detail::append_raw("<", ctx, buffer, ix);
-      xml::detail::append_raw(name, ctx, buffer, ix);
-      xml::detail::append_raw(">", ctx, buffer, ix);
-
-      serialize<XML>::op<set_xml<Opts>()>(std::forward<T>(value), ctx, buffer, ix);
-
-      xml::detail::append_raw("</", ctx, buffer, ix);
-      xml::detail::append_raw(name, ctx, buffer, ix);
-      xml::detail::append_raw(">", ctx, buffer, ix);
+      // write_wrapped_element owns tag emission for both scalars and objects
+      // (whose attributes must land inside this same start tag), so write_xml
+      // never emits <name>/</name> itself -- doing so here as well would
+      // double-wrap object roots.
+      xml::detail::write_wrapped_element<set_xml<Opts>()>(name, std::forward<T>(value), ctx, buffer, ix);
 
       if (bool(ctx.error)) [[unlikely]] {
          return error_ctx{ix, ctx.error, ctx.custom_error_message};

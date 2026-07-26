@@ -162,6 +162,18 @@ namespace glz::xml
       return validate_name(s) && s.find(':') == std::string_view::npos;
    }
 
+   // Member-key sigils that partition a reflected object's members at compile
+   // time into: attribute ("@name"), text content ("#text"), and child element
+   // (everything else).
+   constexpr bool is_attribute_key(std::string_view key) noexcept { return !key.empty() && key.front() == '@'; }
+
+   constexpr bool is_text_key(std::string_view key) noexcept { return key == "#text"; }
+
+   constexpr std::string_view strip_sigil(std::string_view key) noexcept
+   {
+      return is_attribute_key(key) ? key.substr(1) : key;
+   }
+
    // Encodes one scalar as UTF-8. Returns bytes written, or 0 if cp is not a
    // character XML permits.
    constexpr size_t encode_utf8(char32_t cp, char* out) noexcept
