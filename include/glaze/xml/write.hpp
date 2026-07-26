@@ -219,6 +219,27 @@ namespace glz::xml::detail
    template <class T>
    concept xml_writes_own_start_tag_close = (glaze_object_t<T> || reflectable<T>) && !custom_write<T>;
 
+   // True when T is a reflected object with a member keyed "#text" (mixed
+   // content: text interleaved with child elements). Decided entirely at
+   // compile time from the same key sigils the object writer below already
+   // partitions members by, so gating prettify on it costs nothing at
+   // runtime. reflectable<T> aggregates can never have a "#text" key (a C++
+   // member name cannot contain '#'), so this only ever fires for
+   // glaze_object_t<T> in practice, but the loop is harmless either way.
+   template <class T>
+   consteval bool has_text_member() noexcept
+   {
+      using V = std::remove_cvref_t<T>;
+      if constexpr (glaze_object_t<V> || reflectable<V>) {
+         for (size_t i = 0; i < reflect<V>::size; ++i) {
+            if (is_text_key(reflect<V>::keys[i])) {
+               return true;
+            }
+         }
+      }
+      return false;
+   }
+
    // Writes `<name ...attrs>body</name>` for a single element and is the ONLY
    // place that emits an element's start/end tags. Both write_xml (for the
    // document root) and the reflected-object writer's element pass (for every
@@ -298,14 +319,21 @@ namespace glz::xml::detail
    // as `template <auto Opts>`). Every item still goes through
    // write_wrapped_element above, so a given tag is still written in exactly
    // one place. An empty sequence writes nothing at all, not an empty element.
-   template <auto Opts, class T>
+   //
+   // SuppressPrettify is true when the enclosing struct (the type whose body
+   // this sequence's items are siblings within) has a "#text" member -- i.e.
+   // the same has_text_member<T> check the object writer's pass 2 loop uses
+   // for its own direct child branch. Without it, the per-item indent below
+   // would land in that struct's mixed-content body and corrupt its #text
+   // value on read-back, exactly like the single-child case.
+   template <auto Opts, bool SuppressPrettify, class T>
    void write_sequence(std::string_view name, T&& value, is_context auto& ctx, auto& b, auto& ix)
    {
       for (auto&& item : value) {
          if (bool(ctx.error)) [[unlikely]] {
             return;
          }
-         if constexpr (check_prettify(Opts)) {
+         if constexpr (check_prettify(Opts) && !SuppressPrettify) {
             append_indent<Opts>(ctx, b, ix);
             ctx.wrote_element_child = true;
          }
@@ -331,6 +359,14 @@ namespace glz
       static void op(V&& value, is_context auto&& ctx, B&& b, auto&& ix)
       {
          static constexpr auto N = reflect<T>::size;
+
+         // Mixed content (a "#text" member alongside element members) must be
+         // written compactly: any whitespace inserted into this element's body
+         // -- before a child's opening tag, or before this element's own
+         // closing tag -- would be absorbed into the #text value and silently
+         // corrupt it on read-back. Known at compile time from the same key
+         // sigils partitioned below.
+         static constexpr bool has_text = xml::detail::has_text_member<T>();
 
          decltype(auto) t = [&]() -> decltype(auto) {
             if constexpr (reflectable<T>) {
@@ -413,7 +449,7 @@ namespace glz
                // this bypasses write_wrapped_element for the member as a whole
                // and hands the key down to write_sequence instead, which calls
                // write_wrapped_element once per item.
-               xml::detail::write_sequence<Opts>(key, member.template operator()<I>(), ctx, b, ix);
+               xml::detail::write_sequence<Opts, has_text>(key, member.template operator()<I>(), ctx, b, ix);
             }
             else {
                // A disengaged nullable member: the object writer is the only place
@@ -424,7 +460,12 @@ namespace glz
                if (skip_member<Opts>(member.template operator()<I>())) {
                   return;
                }
-               if constexpr (xml::check_prettify(Opts)) {
+               // has_text: see the comment above N. An element that carries
+               // text is written compactly, so no indent precedes this child
+               // and it never marks wrote_element_child -- which is exactly
+               // what keeps write_wrapped_element from indenting this
+               // element's own closing tag below.
+               if constexpr (xml::check_prettify(Opts) && !has_text) {
                   xml::detail::append_indent<Opts>(ctx, b, ix);
                   ctx.wrote_element_child = true;
                }

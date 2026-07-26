@@ -904,6 +904,19 @@ struct glz::meta<xml_variant_holder>
    static constexpr auto value = object("v", &T::v);
 };
 
+struct xml_mixed
+{
+   std::string text{};
+   std::string child{};
+};
+
+template <>
+struct glz::meta<xml_mixed>
+{
+   using T = xml_mixed;
+   static constexpr auto value = object("#text", &T::text, "child", &T::child);
+};
+
 suite nullable_variant_prettify = [] {
    "null_members_skipped_by_default"_test = [] {
       const xml_opt_holder h{.maybe = std::nullopt, .always = "x"};
@@ -966,6 +979,18 @@ suite nullable_variant_prettify = [] {
       const auto out =
          glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(u).value_or("<error>");
       expect(out == "<user id=\"1\" role=\"r\">Alice</user>") << out;
+   };
+
+   "prettify_does_not_corrupt_mixed_content"_test = [] {
+      // An element with BOTH #text and element children. Indenting it appends
+      // the newline and indent to the text value -- #text becomes "HELLO\n   "
+      // instead of "HELLO", silent corruption on read-back.
+      const xml_mixed m{.text = "HELLO", .child = "c"};
+      const auto compact = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(m, "m").value_or("<error>");
+      const auto pretty =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(m, "m").value_or("<error>");
+      expect(compact == "<m>HELLO<child>c</child></m>") << compact;
+      expect(pretty == compact) << "mixed content must be written compactly even with prettify: " << pretty;
    };
 
    "declaration_precedes_prettified_root"_test = [] {
