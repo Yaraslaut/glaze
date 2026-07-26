@@ -17,6 +17,7 @@
 #include "glaze/core/to.hpp"
 #include "glaze/core/write.hpp"
 #include "glaze/core/write_chars.hpp"
+#include "glaze/json/generic_fwd.hpp"
 #include "glaze/util/dump.hpp"
 #include "glaze/util/for_each.hpp"
 #include "glaze/util/variant.hpp"
@@ -216,6 +217,16 @@ namespace glz::xml::detail
    template <nullable_like T>
       requires(!custom_write<T>)
    struct xml_owns_start_tag_close<T> : xml_owns_start_tag_close<std::remove_cvref_t<decltype(*std::declval<T&>())>>
+   {};
+
+   // glz::generic (untyped) values have the same problem as variants, for
+   // the same reason: whether the value needs an attribute pass before '>'
+   // depends on whether it currently holds an object_t, which is only known
+   // at runtime. to<XML, generic_json<Mode, MapType>>::op below always takes
+   // responsibility for its own '>', mirroring the is_variant clause above.
+   template <num_mode Mode, template <class> class MapType>
+      requires(!custom_write<generic_json<Mode, MapType>>)
+   struct xml_owns_start_tag_close<generic_json<Mode, MapType>> : std::true_type
    {};
 
    template <class T>
@@ -626,6 +637,143 @@ namespace glz
             }
             xml::detail::write_wrapped_element<Opts>(key_sv, mapped, ctx, b, ix);
          }
+      }
+   };
+
+   // glz::generic (untyped): reverses the mapping from<XML, generic_json<Mode,
+   // MapType>> (xml/read.hpp) builds -- "@name" keys become attributes,
+   // "#text" becomes body text, an array_t value repeats its key as sibling
+   // elements (write_sequence, exactly like a reflected object's sequence
+   // member), and everything else gets one wrapped child element. A value
+   // that is not an object_t at all (the read side's collapse case: an
+   // element with no attributes and no children reads back as a bare string)
+   // writes as body text/content directly, with no attribute pass -- which is
+   // why this type must own its start tag close (see xml_owns_start_tag_close
+   // above): whether an attribute pass happens depends on the runtime
+   // variant alternative, not on the static type, the same reason is_variant
+   // owns its own close.
+   template <num_mode Mode, template <class> class MapType>
+      requires(not custom_write<generic_json<Mode, MapType>>)
+   struct to<XML, generic_json<Mode, MapType>>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         using G = std::remove_cvref_t<decltype(value)>;
+         using object_t = typename G::object_t;
+         using array_t = typename G::array_t;
+
+         if (const auto* obj = value.template get_if<object_t>()) {
+            // Pass 1: attributes, then close the start tag -- mirrors the
+            // reflected-object writer, but over a runtime map instead of
+            // compile-time reflected keys.
+            for (auto&& [key, mapped] : *obj) {
+               if (bool(ctx.error)) [[unlikely]] {
+                  return;
+               }
+               if (!xml::is_attribute_key(key)) {
+                  continue; // handled in pass 2
+               }
+               const auto attr_name = xml::strip_sigil(std::string_view{key});
+               if constexpr (xml::check_validate_names(Opts)) {
+                  if (!xml::validate_name(attr_name)) [[unlikely]] {
+                     ctx.error = error_code::syntax_error;
+                     ctx.custom_error_message = "generic attribute key is not a valid XML Name";
+                     return;
+                  }
+               }
+               const std::string* attr_value = mapped.template get_if<std::string>();
+               if (!attr_value) [[unlikely]] {
+                  ctx.error = error_code::syntax_error;
+                  ctx.custom_error_message = "a generic attribute value must be a string";
+                  return;
+               }
+               xml::detail::append_raw(" ", ctx, b, ix);
+               xml::detail::append_raw(attr_name, ctx, b, ix);
+               xml::detail::append_raw("=\"", ctx, b, ix);
+               xml::escape_attribute(*attr_value, ctx, b, ix);
+               xml::detail::append_raw("\"", ctx, b, ix);
+            }
+            if (not bool(ctx.error)) [[likely]] {
+               xml::detail::append_raw(">", ctx, b, ix);
+            }
+
+            // Pass 2: text, then child elements.
+            for (auto&& [key, mapped] : *obj) {
+               if (bool(ctx.error)) [[unlikely]] {
+                  return;
+               }
+               if (xml::is_attribute_key(key)) {
+                  continue; // pass 1
+               }
+               if (xml::is_text_key(key)) {
+                  const std::string* text = mapped.template get_if<std::string>();
+                  if (!text) [[unlikely]] {
+                     ctx.error = error_code::syntax_error;
+                     ctx.custom_error_message = "a generic #text value must be a string";
+                     return;
+                  }
+                  xml::escape_text(*text, ctx, b, ix);
+                  continue;
+               }
+               const std::string_view key_sv{key};
+               if constexpr (xml::check_validate_names(Opts)) {
+                  if (!xml::validate_name(key_sv)) [[unlikely]] {
+                     ctx.error = error_code::syntax_error;
+                     ctx.custom_error_message = "generic element key is not a valid XML Name";
+                     return;
+                  }
+               }
+               if (const array_t* arr = mapped.template get_if<array_t>()) {
+                  xml::detail::write_sequence<Opts, false>(key_sv, *arr, ctx, b, ix);
+               }
+               else {
+                  xml::detail::write_wrapped_element<Opts>(key_sv, mapped, ctx, b, ix);
+               }
+            }
+            return;
+         }
+
+         // Every other alternative: no attributes are possible, so this op
+         // closes the start tag itself immediately (see the class comment
+         // above for why generic_json must always own its close).
+         if (not bool(ctx.error)) [[likely]] {
+            xml::detail::append_raw(">", ctx, b, ix);
+         }
+
+         if (const auto* s = value.template get_if<std::string>()) {
+            xml::escape_text(*s, ctx, b, ix);
+            return;
+         }
+         if (const auto* bv = value.template get_if<bool>()) {
+            xml::detail::append_raw(*bv ? "true" : "false", ctx, b, ix);
+            return;
+         }
+         if constexpr (Mode == num_mode::u64) {
+            if (const auto* u = value.template get_if<uint64_t>()) {
+               to<XML, uint64_t>::template op<Opts>(*u, ctx, b, ix);
+               return;
+            }
+         }
+         if constexpr (Mode == num_mode::u64 || Mode == num_mode::i64) {
+            if (const auto* i = value.template get_if<int64_t>()) {
+               to<XML, int64_t>::template op<Opts>(*i, ctx, b, ix);
+               return;
+            }
+         }
+         if (const auto* d = value.template get_if<double>()) {
+            to<XML, double>::template op<Opts>(*d, ctx, b, ix);
+            return;
+         }
+         if (value.template holds<array_t>()) {
+            // Reached with no enclosing key to name its items -- same
+            // situation, and same answer, as the bare writable_array_t
+            // rejection above.
+            ctx.error = error_code::syntax_error;
+            ctx.custom_error_message = "a nested sequence has no element name";
+            return;
+         }
+         // null_t: nothing further to write.
       }
    };
 }

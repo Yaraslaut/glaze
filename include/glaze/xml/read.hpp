@@ -8,15 +8,19 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 #include "glaze/core/common.hpp"
 #include "glaze/core/context.hpp"
 #include "glaze/core/read.hpp"
 #include "glaze/core/reflect.hpp"
 #include "glaze/file/file_ops.hpp"
+#include "glaze/json/generic_fwd.hpp"
 #include "glaze/json/read.hpp"
 #include "glaze/util/bit_array.hpp"
 #include "glaze/util/for_each.hpp"
+#include "glaze/util/nullable_traits.hpp"
+#include "glaze/util/variant.hpp"
 #include "glaze/xml/common.hpp"
 #include "glaze/xml/skip.hpp"
 
@@ -49,6 +53,76 @@ namespace glz::xml
       }
       const char* p = it + 1;
       return detail::read_name_span(p, end);
+   }
+
+   // Peeks whether the upcoming element (`it` must be at '<') is "empty" for
+   // nullable_like purposes: either self-closing ("<name .../>") or
+   // non-self-closing with zero characters of content ("<name></name>").
+   // Like peek_element_name above, this is a pure classifier -- it never
+   // touches `it` or ctx, so from<XML, nullable_like T> can decide which
+   // branch to take before committing to a real, error-reporting parse. A
+   // malformed or truncated tag simply reports false (not empty); the real
+   // parse that follows in either branch is what actually rejects it.
+   inline bool peek_is_empty_element(const char* it, const char* end) noexcept
+   {
+      if (it >= end || *it != '<') {
+         return false;
+      }
+      const char* p = it + 1;
+      const std::string_view name = detail::read_name_span(p, end);
+      if (name.empty()) {
+         return false;
+      }
+
+      while (true) {
+         const char* const before_ws = p;
+         skip_whitespace(p, end);
+         const bool had_ws = p != before_ws;
+
+         if (p >= end) {
+            return false;
+         }
+         if (*p == '>') {
+            ++p;
+            break;
+         }
+         if (*p == '/') {
+            ++p;
+            return p < end && *p == '>'; // self-closing => empty
+         }
+         if (!had_ws) {
+            return false; // malformed; let the real parse report it
+         }
+
+         const std::string_view attr_name = detail::read_name_span(p, end);
+         if (attr_name.empty()) {
+            return false;
+         }
+         skip_whitespace(p, end);
+         if (p >= end || *p != '=') {
+            return false;
+         }
+         ++p;
+         skip_whitespace(p, end);
+         if (p >= end || (*p != '"' && *p != '\'')) {
+            return false;
+         }
+         const char quote = *p;
+         ++p;
+         // Attribute values cannot contain a literal quote character (escaped
+         // as &quot;/&apos; if needed), so this cannot be fooled by an
+         // embedded '>' or '/' -- only finding the matching quote matters.
+         while (p < end && *p != quote) {
+            ++p;
+         }
+         if (p >= end) {
+            return false;
+         }
+         ++p; // past the closing quote
+      }
+
+      // p is right after the '>' of a non-self-closing start tag.
+      return size_t(end - p) >= 2 && p[0] == '<' && p[1] == '/';
    }
 
    // Consumes CharData interleaved with Comment/PI content until the
@@ -382,6 +456,338 @@ namespace glz
       {
          xml::detail::read_leaf_element<Opts>(
             ctx, it, end, [&](const std::string& text) { xml::detail::assign_scalar_text(value, ctx, text); });
+      }
+   };
+
+   // Sequences: the repeated-sibling convention (mirrored from write_sequence
+   // in xml/write.hpp) means the repetition itself lives in the PARENT --
+   // the reflected-object reader above (Task 12) already special-cases a
+   // readable_array_t/emplace_backable member and loops there, calling
+   // from<XML, item_t> once per occurrence with item_t already unwrapped to
+   // the element type. This specialization exists for every OTHER site that
+   // reaches a sequence type generically -- the held type of a nullable_like
+   // wrapper, a variant alternative, or a map's mapped_type -- where only a
+   // single element is ever at `it`. It therefore parses exactly one item
+   // and never loops; looping here would consume siblings that only the
+   // parent (which owns the loop and the "is this element still the same
+   // key" test) is in a position to recognise.
+   template <class T>
+      requires(readable_array_t<T> && emplace_backable<T> && !custom_read<T>)
+   struct from<XML, T>
+   {
+      template <auto Opts, class It, class End>
+      static void op(auto& value, is_context auto&& ctx, It&& it, End end)
+      {
+         auto& item = value.emplace_back();
+         using item_t = std::remove_cvref_t<decltype(item)>;
+         from<XML, item_t>::template op<Opts>(item, ctx, it, end);
+      }
+   };
+
+   // Maps: each child element becomes one entry, keyed by its tag name, with
+   // the mapped value read via from<XML, mapped_type>. Mirrors the
+   // reflected-object reader's own element-dispatch loop (Task 12) over a
+   // runtime key instead of a compile-time reflected member -- including the
+   // CDATA-safe parse_char_data dispatch discipline documented there.
+   template <class T>
+      requires(readable_map_t<T>)
+   struct from<XML, T>
+   {
+      template <auto Opts, class It, class End>
+      static void op(auto& value, is_context auto&& ctx, It&& it, End end)
+      {
+         using mapped_t = typename std::remove_cvref_t<T>::mapped_type;
+
+         xml::start_tag tag;
+         if (!xml::parse_start_tag(it, end, ctx, tag)) {
+            return;
+         }
+
+         if (!tag.attributes.empty()) {
+            if constexpr (Opts.error_on_unknown_keys) {
+               ctx.error = error_code::unknown_key; // a map has no member to bind an attribute to
+               return;
+            }
+         }
+
+         if (tag.self_closing) {
+            return;
+         }
+
+         while (true) {
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+
+            // Route through parse_char_data unconditionally -- see the
+            // reflected-object reader below for why: it already recognises
+            // '<![CDATA[' as character data and merges it in, and returns
+            // immediately, without consuming, when '<' opens something else.
+            std::string chunk;
+            if (!xml::parse_char_data(it, end, ctx, chunk)) {
+               return;
+            }
+            if (!xml::is_whitespace_only(chunk)) {
+               ctx.error = error_code::syntax_error; // a map has no member to bind text to
+               return;
+            }
+
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+            if (size_t(end - it) >= 2 && it[1] == '/') {
+               std::string end_name;
+               if (!xml::parse_end_tag(it, end, ctx, end_name)) {
+                  return;
+               }
+               break;
+            }
+            if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
+               if (!xml::parse_comment(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+            if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
+               if (!xml::parse_pi(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+
+            const std::string key{xml::peek_element_name(it, end)};
+            if (value.find(key) != value.end()) {
+               ctx.error = error_code::duplicate_key;
+               return;
+            }
+            from<XML, mapped_t>::template op<Opts>(value[key], ctx, it, end);
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+         }
+      }
+   };
+
+   // nullable_like (std::optional, std::unique_ptr, std::shared_ptr, raw
+   // pointers, ...): a self-closing element ("<maybe/>"), or a non-
+   // self-closing one with no content at all ("<maybe></maybe>"), leaves the
+   // value disengaged; anything else constructs the held value and recurses.
+   // xml::peek_is_empty_element is a non-mutating look-ahead (mirroring
+   // xml::peek_element_name) precisely because parse_start_tag pushes the
+   // element name onto ctx.element_stack as a side effect -- calling it
+   // speculatively and then again for real would push twice.
+   template <nullable_like T>
+      requires(!custom_read<T>)
+   struct from<XML, T>
+   {
+      template <auto Opts, class It, class End>
+      static void op(auto& value, is_context auto&& ctx, It&& it, End end)
+      {
+         if (xml::peek_is_empty_element(it, end)) {
+            xml::start_tag tag;
+            if (!xml::parse_start_tag(it, end, ctx, tag)) {
+               return;
+            }
+            if (!tag.self_closing) {
+               std::string end_name;
+               if (!xml::parse_end_tag(it, end, ctx, end_name)) {
+                  return;
+               }
+            }
+            value = {};
+            return;
+         }
+
+         if (!nullable_emplace<Opts>(value, ctx)) {
+            return;
+         }
+         using V = std::remove_cvref_t<decltype(*value)>;
+         from<XML, V>::template op<Opts>(*value, ctx, it, end);
+      }
+   };
+
+   // is_variant: try each alternative in declaration order against a saved
+   // cursor, restoring both the iterator and any state a failed attempt
+   // mutated between tries. Mirrors include/glaze/yaml/read.hpp's variant
+   // fallback (its is_variant<T> struct from<YAML, T>::op, around line
+   // 6244-6273): a speculative attempt runs against a scratch copy of `it`,
+   // and on failure the shared ctx.error is cleared and ctx.element_stack is
+   // truncated back to its pre-attempt size -- necessary here (unlike a
+   // format with no such stack) because a partially-parsed nested element
+   // that never reached its own end tag would otherwise leave stale entries
+   // behind for the next alternative. error_code::no_matching_variant_type
+   // is set only if every alternative fails.
+   template <is_variant T>
+      requires(!custom_read<T>)
+   struct from<XML, T>
+   {
+      template <auto Opts, class It, class End>
+      static void op(auto& value, is_context auto&& ctx, It&& it, End end)
+      {
+         if (bool(ctx.error)) [[unlikely]] {
+            return;
+         }
+
+         using V = std::remove_cvref_t<T>;
+         static constexpr auto N = std::variant_size_v<V>;
+
+         const auto start = it;
+         const auto stack_depth = ctx.element_stack.size();
+
+         auto try_parse = [&]<size_t I>() -> bool {
+            using Alt = std::variant_alternative_t<I, V>;
+            Alt alt{};
+            auto attempt_it = start;
+            from<XML, Alt>::template op<Opts>(alt, ctx, attempt_it, end);
+            if (!bool(ctx.error)) {
+               value = std::move(alt);
+               it = attempt_it;
+               return true;
+            }
+            ctx.error = error_code::none;
+            ctx.custom_error_message = {};
+            ctx.element_stack.resize(stack_depth);
+            return false;
+         };
+
+         bool parsed = false;
+         for_each_short_circuit<N>([&]<size_t I>() { return (parsed = try_parse.template operator()<I>()); });
+
+         if (!parsed) {
+            ctx.error = error_code::no_matching_variant_type;
+         }
+      }
+   };
+
+   // glz::generic (untyped) reader: builds an object_t per element using the
+   // documented XML<->generic mapping --
+   //   * each attribute becomes key "@name" with a string value (no type
+   //     guessing: XML has no schema here to tell a number from a numeric
+   //     string, so nothing is guessed);
+   //   * non-whitespace text becomes "#text", also a string;
+   //   * each child element becomes a key holding the child's own value on
+   //     its first occurrence, or an array_t accumulating both once a second
+   //     occurrence of the same key is seen.
+   // An element with no attributes, no children, and only text collapses to
+   // a bare string -- its accumulated text, verbatim -- rather than
+   // {"#text": "..."}; this is what lets g["title"].get<std::string>() work
+   // directly instead of every leaf needing {"#text": ...} unwrapped by hand.
+   //
+   // Documented limitation: reading into glz::generic cannot distinguish a
+   // single occurrence of a child element from a genuine one-element list,
+   // because there is no declared type to consult here -- the occurrence
+   // COUNT decides (one -> the child's own value, two or more -> array_t).
+   // Contrast the typed path above: a std::vector<T> member always collects,
+   // even for a single occurrence, because the declared type removes the
+   // ambiguity.
+   template <num_mode Mode, template <class> class MapType>
+      requires(!custom_read<generic_json<Mode, MapType>>)
+   struct from<XML, generic_json<Mode, MapType>>
+   {
+      template <auto Opts, class It, class End>
+      static void op(auto& value, is_context auto&& ctx, It&& it, End end)
+      {
+         using G = std::remove_cvref_t<decltype(value)>;
+
+         xml::start_tag tag;
+         if (!xml::parse_start_tag(it, end, ctx, tag)) {
+            return;
+         }
+
+         const bool any_attr = !tag.attributes.empty();
+         for (const auto& attr : tag.attributes) {
+            std::string key;
+            key.reserve(attr.name.size() + 1);
+            key += '@';
+            key += attr.name;
+            value[key] = attr.value;
+         }
+
+         if (tag.self_closing) {
+            if (!any_attr) {
+               value.data = std::string{};
+            }
+            return;
+         }
+
+         bool any_child = false;
+         std::string text;
+
+         while (true) {
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+
+            // Route through parse_char_data unconditionally -- see the
+            // reflected-object reader below for the CDATA-at-content-start
+            // hazard this discipline avoids.
+            std::string chunk;
+            if (!xml::parse_char_data(it, end, ctx, chunk)) {
+               return;
+            }
+            text += chunk;
+
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+            if (size_t(end - it) >= 2 && it[1] == '/') {
+               std::string end_name;
+               if (!xml::parse_end_tag(it, end, ctx, end_name)) {
+                  return;
+               }
+               break;
+            }
+            if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
+               if (!xml::parse_comment(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+            if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
+               if (!xml::parse_pi(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+
+            const std::string_view child_name = xml::peek_element_name(it, end);
+            const bool existed = value.contains(child_name);
+
+            G child{};
+            from<XML, G>::template op<Opts>(child, ctx, it, end);
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            any_child = true;
+
+            if (!existed) {
+               value[child_name] = std::move(child);
+            }
+            else {
+               auto& slot = value[child_name];
+               if (slot.is_array()) {
+                  slot.get_array().push_back(std::move(child));
+               }
+               else {
+                  typename G::array_t arr;
+                  arr.push_back(std::move(slot));
+                  arr.push_back(std::move(child));
+                  slot.data = std::move(arr);
+               }
+            }
+         }
+
+         if (!any_attr && !any_child) {
+            value.data = std::move(text);
+            return;
+         }
+         if (!xml::is_whitespace_only(text)) {
+            value["#text"] = text;
+         }
       }
    };
 

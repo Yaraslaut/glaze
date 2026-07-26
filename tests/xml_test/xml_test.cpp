@@ -18,6 +18,7 @@
 #include <variant>
 #include <vector>
 
+#include "glaze/json/generic.hpp"
 #include "ut/ut.hpp"
 
 using namespace ut;
@@ -1696,6 +1697,130 @@ suite cdata_in_content = [] {
       expect(!ec) << glz::format_error(ec, xml);
       expect(b.title == "T");
       expect(b.year == 1) << "the skipper must consume past the CDATA to reach <year>";
+   };
+};
+
+suite container_and_generic_reading = [] {
+   "repeated_elements_fill_vector"_test = [] {
+      xml_shelf s{};
+      const std::string xml = "<shelf><name>a</name><tag>1</tag><tag>2</tag><tag>3</tag></shelf>";
+      const auto ec = glz::read_xml(s, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(s.name == "a");
+      expect(s.tag == std::vector<int>{1, 2, 3});
+   };
+
+   "single_occurrence_still_fills_vector"_test = [] {
+      // Typed reads are unambiguous: the member is a vector, so one <tag>
+      // yields a one-element vector rather than a scalar.
+      xml_shelf s{};
+      const auto ec = glz::read_xml(s, std::string{"<shelf><name>a</name><tag>9</tag></shelf>"});
+      expect(!ec);
+      expect(s.tag == std::vector<int>{9});
+   };
+
+   "absent_repeated_element_yields_empty_vector"_test = [] {
+      xml_shelf s{};
+      const auto ec = glz::read_xml(s, std::string{"<shelf><name>a</name></shelf>"});
+      expect(!ec);
+      expect(s.tag.empty());
+   };
+
+   "vector_of_structs"_test = [] {
+      xml_library lib{};
+      const std::string xml =
+         "<library><book><title>A</title><year>1</year></book>"
+         "<book><title>B</title><year>2</year></book></library>";
+      const auto ec = glz::read_xml(lib, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(lib.book.size() == size_t(2));
+      expect(lib.book[0].title == "A");
+      expect(lib.book[1].year == 2);
+   };
+
+   "repeated_element_into_scalar_member_is_an_error"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml(b, std::string{"<book><title>A</title><title>B</title></book>"});
+      expect(bool(ec));
+      expect(ec == glz::error_code::duplicate_key);
+   };
+
+   "map_reading"_test = [] {
+      std::map<std::string, int> m{};
+      const std::string xml = "<m><alpha>1</alpha><beta>2</beta></m>";
+      const auto ec = glz::read_xml(m, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(m.size() == size_t(2));
+      expect(m["alpha"] == 1);
+      expect(m["beta"] == 2);
+   };
+
+   "optional_present_and_absent"_test = [] {
+      xml_opt_holder h{};
+      expect(!glz::read_xml(h, std::string{"<h><maybe>5</maybe><always>x</always></h>"}));
+      expect(h.maybe.has_value());
+      expect(*h.maybe == 5);
+
+      xml_opt_holder h2{};
+      expect(!glz::read_xml(h2, std::string{"<h><always>x</always></h>"}));
+      expect(!h2.maybe.has_value());
+
+      // An empty element reads as a disengaged optional.
+      xml_opt_holder h3{};
+      expect(!glz::read_xml(h3, std::string{"<h><maybe/><always>x</always></h>"}));
+      expect(!h3.maybe.has_value());
+   };
+
+   "variant_reading"_test = [] {
+      xml_variant_holder a{};
+      expect(!glz::read_xml(a, std::string{"<h><v>42</v></h>"}));
+      expect(std::holds_alternative<int>(a.v));
+      expect(std::get<int>(a.v) == 42);
+
+      xml_variant_holder b{};
+      expect(!glz::read_xml(b, std::string{"<h><v>hello</v></h>"}));
+      expect(std::holds_alternative<std::string>(b.v));
+      expect(std::get<std::string>(b.v) == "hello");
+   };
+
+   "generic_object"_test = [] {
+      glz::generic g{};
+      const std::string xml = R"(<user id="7" role="admin">Alice</user>)";
+      const auto ec = glz::read_xml(g, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      // Attributes keep the '@' sigil and stay strings; no type guessing.
+      expect(g["@id"].get<std::string>() == "7");
+      expect(g["@role"].get<std::string>() == "admin");
+      expect(g["#text"].get<std::string>() == "Alice");
+   };
+
+   "generic_nested_elements"_test = [] {
+      glz::generic g{};
+      const auto ec = glz::read_xml(g, std::string{"<book><title>Dune</title><year>1965</year></book>"});
+      expect(!ec);
+      expect(g["title"].get<std::string>() == "Dune");
+      // Element text is a string in the untyped path too.
+      expect(g["year"].get<std::string>() == "1965");
+   };
+
+   "generic_repeated_element_count_heuristic"_test = [] {
+      // Documented limitation: with no type to consult, the count decides.
+      glz::generic one{};
+      expect(!glz::read_xml(one, std::string{"<r><i>1</i></r>"}));
+      expect(!one["i"].is_array()) << "a single occurrence stays scalar";
+
+      glz::generic many{};
+      expect(!glz::read_xml(many, std::string{"<r><i>1</i><i>2</i></r>"}));
+      expect(many["i"].is_array());
+      expect(many["i"].size() == size_t(2));
+   };
+
+   "generic_roundtrip_through_write"_test = [] {
+      glz::generic g{};
+      const std::string xml = "<book><title>Dune</title><year>1965</year></book>";
+      expect(!glz::read_xml(g, xml));
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(g, "book").value_or("<error>");
+      expect(out == xml) << out;
    };
 };
 
