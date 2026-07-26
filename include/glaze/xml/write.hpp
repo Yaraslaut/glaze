@@ -123,26 +123,6 @@ namespace glz
       }
    };
 
-   // Engaged optionals/pointers recurse into the held value. The disengaged case is
-   // deliberately not handled here: only the object writer (below) can suppress the
-   // surrounding <key>/</key> tags entirely (skip_null_members), so that decision --
-   // skip the member, or emit <key></key> -- lives there. A disengaged nullable
-   // reached any other way (the document root, a variant alternative, ...) simply
-   // has no body to write, which write_wrapped_element already renders as an empty
-   // element.
-   template <nullable_like T>
-      requires(not custom_write<T>)
-   struct to<XML, T>
-   {
-      template <auto Opts, class... Args>
-      static void op(auto&& value, is_context auto&& ctx, Args&&... args)
-      {
-         if (value) {
-            serialize<XML>::op<Opts>(*value, ctx, std::forward<Args>(args)...);
-         }
-      }
-   };
-
    // std::chrono::system_clock time points and year_month_day: ISO 8601 text
    // content, sharing the digit layout with every other Glaze format via
    // chrono_detail (glaze/core/chrono.hpp). Durations and steady_clock /
@@ -201,27 +181,45 @@ namespace glz::xml::detail
    template <class T>
    concept xml_reflected_object = (glaze_object_t<T> || reflectable<T>) && !custom_write<T>;
 
-   // A type whose to<XML, T>::op writes its own '>' after emitting attributes.
-   // MUST stay in lockstep with xml_reflected_object -- if the two ever
-   // diverge, the start tag is either never closed (a type matches here but
-   // the object specialization below doesn't run, so nothing ever writes '>')
-   // or closed twice (the reverse).
+   // Does T's to<XML, T>::op write its own '>' after emitting attributes?
+   //
+   // MUST stay in lockstep with xml_reflected_object for reflected objects
+   // themselves -- if the two ever diverge, the start tag is either never
+   // closed (a type matches here but the object specialization below doesn't
+   // run, so nothing ever writes '>') or closed twice (the reverse).
    //
    // Variants are included too, but for a different reason: which shape a
    // variant needs (own-close vs. helper-closes) depends on the *active
    // alternative*, which is only known at runtime -- no compile-time branch
    // on the variant's static type can get this right. So a variant always
    // takes responsibility for its own start tag close, and to<XML, is_variant
-   // T>::op (below) re-applies this same concept, per alternative, inside the
+   // T>::op (below) re-applies this same trait, per alternative, inside the
    // std::visit to decide whether to delegate (object alternative closes
    // itself) or close '>' itself first (scalar/string/enum/container/nested-
-   // variant alternative). Without this, write_wrapped_element would always
-   // write '>' for a variant (its static type never satisfies the object
-   // clause), and an object alternative would then write a second '>' of its
-   // own -- well-formed but silently wrong output (a stray '>' character
-   // lands in the element body).
+   // variant alternative).
+   //
+   // This must also PROPAGATE THROUGH WRAPPERS. A wrapper's own type (e.g.
+   // std::optional<Obj>, std::unique_ptr<Obj>) never satisfies the object
+   // clause above, but to<XML, nullable_like T>::op forwards to the held
+   // value -- and if that held value is a reflected object (or a variant),
+   // IT owns the close. If the property doesn't follow the forwarding,
+   // write_wrapped_element writes '>' for the wrapper, and the held object's
+   // own writer then writes a second '>' -- well-formed XML with a stray '>'
+   // character in the body and no error: silent corruption. This has now
+   // bitten std::variant and std::optional; expressing it recursively over
+   // nullable_like stops the next wrapper (any nullable_like: optional,
+   // unique_ptr, shared_ptr, raw pointer, ...) from repeating it.
    template <class T>
-   concept xml_writes_own_start_tag_close = xml_reflected_object<T> || (is_variant<T> && !custom_write<T>);
+   struct xml_owns_start_tag_close : std::bool_constant<xml_reflected_object<T> || (is_variant<T> && !custom_write<T>)>
+   {};
+
+   template <nullable_like T>
+      requires(!custom_write<T>)
+   struct xml_owns_start_tag_close<T> : xml_owns_start_tag_close<std::remove_cvref_t<decltype(*std::declval<T&>())>>
+   {};
+
+   template <class T>
+   concept xml_writes_own_start_tag_close = xml_owns_start_tag_close<std::remove_cvref_t<T>>::value;
 
    // True when T is a reflected object with a member keyed "#text" (mixed
    // content: text interleaved with child elements). Decided entirely at
@@ -348,6 +346,53 @@ namespace glz::xml::detail
 
 namespace glz
 {
+   // Engaged optionals/pointers recurse into the held value. Which member is
+   // responsible for the '>' that closes this element's start tag is decided
+   // entirely by xml::detail::xml_writes_own_start_tag_close<T>, which
+   // (see its definition) propagates through nullable_like wrappers to the
+   // held type -- so this op's own T (e.g. optional<Obj>) reports exactly
+   // the same answer as Obj itself would. The caller (write_wrapped_element,
+   // or a variant's visit for a nullable alternative) already consulted that
+   // same trait on this same T before invoking this op:
+   //  - trait false (e.g. optional<int>, optional<string>): the caller has
+   //    ALREADY written '>' for us, so this op must not write another one --
+   //    it only ever produces body text, exactly as before this type existed.
+   //  - trait true (held type is a reflected object, or -- recursively -- a
+   //    variant/nullable that is itself own-closing): the caller deliberately
+   //    did NOT write '>', because it expects THIS op to. When engaged, that
+   //    happens by simply delegating to the held value's own writer, which
+   //    emits its attribute pass and then its own '>'. When disengaged there
+   //    is no held object to delegate to, so this op writes the '>' directly
+   //    -- otherwise the start tag would be left permanently unclosed
+   //    (`<v` with no '>' at all), not merely empty.
+   //
+   // Only the object writer (below) can suppress the surrounding <key>/</key>
+   // tags entirely (skip_null_members); that decision -- skip the member, or
+   // emit <key></key> (or <key attrs></key>...) -- lives there, not here.
+   template <nullable_like T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         using V = std::remove_cvref_t<decltype(value)>;
+         if constexpr (xml::detail::xml_writes_own_start_tag_close<V>) {
+            if (value) {
+               serialize<XML>::op<Opts>(*value, ctx, b, ix);
+            }
+            else if (not bool(ctx.error)) [[likely]] {
+               xml::detail::append_raw(">", ctx, b, ix);
+            }
+         }
+         else {
+            if (value) {
+               serialize<XML>::op<Opts>(*value, ctx, b, ix);
+            }
+         }
+      }
+   };
+
    // std::visit onto the active alternative -- mirrors the TOML writer
    // (toml/write.hpp:1461-1475). The active alternative is written exactly as if it
    // had been the member's declared type, so a variant<int, string> member writes

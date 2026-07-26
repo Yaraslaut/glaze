@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1070,6 +1071,90 @@ suite variant_of_object = [] {
       const var_obj_attr_holder h{.v = var_obj_attr_alt{.id = 1, .a = "hi"}};
       const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
       expect(s == "<h><v id=\"1\"><a>hi</a></v></h>") << s;
+   };
+};
+
+struct wrap_obj
+{
+   std::string a{};
+};
+
+template <>
+struct glz::meta<wrap_obj>
+{
+   using T = wrap_obj;
+   static constexpr auto value = object("a", &T::a);
+};
+
+struct opt_obj_holder
+{
+   std::optional<wrap_obj> v{};
+};
+
+template <>
+struct glz::meta<opt_obj_holder>
+{
+   using T = opt_obj_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+struct ptr_obj_holder
+{
+   std::unique_ptr<wrap_obj> v{};
+};
+
+template <>
+struct glz::meta<ptr_obj_holder>
+{
+   using T = ptr_obj_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+struct var_opt_holder
+{
+   std::variant<int, std::optional<wrap_obj>> v{};
+};
+
+template <>
+struct glz::meta<var_opt_holder>
+{
+   using T = var_opt_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+suite wrapper_tag_close = [] {
+   "optional_of_object_writes_one_close_bracket"_test = [] {
+      // The tag-close property must propagate through the wrapper. Without it
+      // write_wrapped_element writes '>' and the inner object writer writes
+      // another -- well-formed XML with a stray '>' and no error.
+      const opt_obj_holder h{.v = wrap_obj{.a = "hi"}};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v><a>hi</a></v></h>") << s;
+   };
+
+   "unique_ptr_of_object_writes_one_close_bracket"_test = [] {
+      ptr_obj_holder h{};
+      h.v = std::make_unique<wrap_obj>(wrap_obj{.a = "hi"});
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v><a>hi</a></v></h>") << s;
+   };
+
+   "variant_of_optional_of_object"_test = [] {
+      const var_opt_holder h{.v = std::optional<wrap_obj>{wrap_obj{.a = "hi"}}};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v><a>hi</a></v></h>") << s;
+   };
+
+   "optional_of_scalar_unaffected"_test = [] {
+      const xml_opt_holder h{.maybe = 5, .always = "x"};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><maybe>5</maybe><always>x</always></h>") << s;
+   };
+
+   "disengaged_optional_of_object_still_skipped"_test = [] {
+      const opt_obj_holder h{.v = std::nullopt};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h></h>") << s;
    };
 };
 
