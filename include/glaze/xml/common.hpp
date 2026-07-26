@@ -316,6 +316,23 @@ namespace glz::xml
          std::memcpy(b.data() + ix, s.data(), s.size());
          ix += s.size();
       }
+
+      // Prettify only: '\n' followed by indentation_width * ctx.indent_depth spaces.
+      // Same ensure_space growth pattern as append_raw above.
+      template <auto Opts, class B>
+      void append_indent(is_context auto& ctx, B& b, auto& ix)
+      {
+         const size_t n = size_t(check_indentation_width(Opts)) * ctx.indent_depth;
+         if (!ensure_space(ctx, b, ix + 1 + n)) [[unlikely]] {
+            return;
+         }
+         *(b.data() + ix) = '\n';
+         ++ix;
+         if (n) {
+            std::memset(b.data() + ix, ' ', n);
+            ix += n;
+         }
+      }
    }
 
    // Escapes character data. '>' is escaped unconditionally, which is stricter
@@ -400,6 +417,21 @@ namespace glz::xml
       // glz::is_context<xml_context> and the shared glz::depth_guard used by
       // every other format reader.
       size_t element_depth() const noexcept { return element_stack.size(); }
+
+      // Prettify (writer only). indent_depth is the current nesting depth used
+      // to compute how many spaces precede a child element -- write_wrapped_element
+      // increments it for the duration of a value's body, so indentation_width *
+      // indent_depth is always the depth of whatever is being written right now.
+      //
+      // wrote_element_child is a single-frame accumulator: the loop sites that
+      // emit child elements (the object writer's element pass, write_sequence,
+      // and the map writer) set it to true immediately before writing each child.
+      // write_wrapped_element saves/resets it before writing a value's body and
+      // reads it back after, to decide whether that value's body consisted of
+      // child elements (indent before the closing tag) or was plain text/scalar
+      // content (no added whitespace, so text values are never altered).
+      size_t indent_depth = 0;
+      bool wrote_element_child = false;
 
       std::string_view current_element() const noexcept
       {

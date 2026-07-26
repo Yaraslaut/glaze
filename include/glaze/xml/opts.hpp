@@ -80,6 +80,16 @@ namespace glz::xml
       }
    }
 
+   consteval bool check_prettify(auto&& o)
+   {
+      if constexpr (requires { o.prettify; }) {
+         return o.prettify;
+      }
+      else {
+         return false;
+      }
+   }
+
    consteval bool check_validate_names(auto&& o)
    {
       if constexpr (requires { o.validate_names; }) {

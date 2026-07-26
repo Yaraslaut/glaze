@@ -4,14 +4,17 @@
 #include "glaze/xml.hpp"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <concepts>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "ut/ut.hpp"
@@ -873,6 +876,141 @@ suite nested_container_rejection = [] {
       const auto ec = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, buffer, "s");
       expect(bool(ec)) << "nested sequence must still error";
       expect(!buffer.starts_with("<s><m></m></s>")) << "must not emit a well-formed but bogus element: " << buffer;
+   };
+};
+
+struct xml_opt_holder
+{
+   std::optional<int> maybe{};
+   std::string always{};
+};
+
+template <>
+struct glz::meta<xml_opt_holder>
+{
+   using T = xml_opt_holder;
+   static constexpr auto value = object("maybe", &T::maybe, "always", &T::always);
+};
+
+struct xml_variant_holder
+{
+   std::variant<int, std::string> v{};
+};
+
+template <>
+struct glz::meta<xml_variant_holder>
+{
+   using T = xml_variant_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+suite nullable_variant_prettify = [] {
+   "null_members_skipped_by_default"_test = [] {
+      const xml_opt_holder h{.maybe = std::nullopt, .always = "x"};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(out == "<h><always>x</always></h>") << out;
+   };
+
+   "null_members_emitted_when_not_skipping"_test = [] {
+      const xml_opt_holder h{.maybe = std::nullopt, .always = "x"};
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.skip_null_members = false, .write_declaration = false}>(h, "h").value_or(
+            "<error>");
+      // An absent value is represented by an empty element.
+      expect(out == "<h><maybe></maybe><always>x</always></h>") << out;
+   };
+
+   "engaged_optional_writes_value"_test = [] {
+      const xml_opt_holder h{.maybe = 5, .always = "x"};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(out == "<h><maybe>5</maybe><always>x</always></h>") << out;
+   };
+
+   "variant_writes_active_alternative"_test = [] {
+      const xml_variant_holder a{.v = 42};
+      expect(glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(a, "h").value_or("") == "<h><v>42</v></h>");
+      const xml_variant_holder b{.v = std::string{"hi"}};
+      expect(glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(b, "h").value_or("") == "<h><v>hi</v></h>");
+   };
+
+   "prettify_uses_indentation_width"_test = [] {
+      const xml_book b{.title = "Dune", .year = 1965};
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(b, "book").value_or(
+            "<error>");
+      expect(out ==
+             "<book>\n"
+             "   <title>Dune</title>\n"
+             "   <year>1965</year>\n"
+             "</book>")
+         << out;
+   };
+
+   "prettify_custom_indentation_width"_test = [] {
+      const xml_book b{.title = "D", .year = 1};
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true, .indentation_width = 2}>(
+            b, "book")
+            .value_or("<error>");
+      expect(out ==
+             "<book>\n"
+             "  <title>D</title>\n"
+             "  <year>1</year>\n"
+             "</book>")
+         << out;
+   };
+
+   "prettify_does_not_add_whitespace_to_text_content"_test = [] {
+      // Indenting an element that holds text would change that text's value.
+      const xml_user u{.id = 1, .role = "r", .text = "Alice"};
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(u).value_or("<error>");
+      expect(out == "<user id=\"1\" role=\"r\">Alice</user>") << out;
+   };
+
+   "declaration_precedes_prettified_root"_test = [] {
+      const xml_book b{.title = "D", .year = 1};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.prettify = true}>(b, "book").value_or("<error>");
+      expect(out.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<book>")) << out;
+   };
+};
+
+struct xml_chrono_holder
+{
+   std::chrono::sys_time<std::chrono::seconds> at{};
+   std::chrono::sys_days day{};
+   std::chrono::year_month_day ymd{};
+};
+
+template <>
+struct glz::meta<xml_chrono_holder>
+{
+   using T = xml_chrono_holder;
+   static constexpr auto value = object("at", &T::at, "day", &T::day, "ymd", &T::ymd);
+};
+
+suite chrono_types = [] {
+   using namespace std::chrono;
+
+   // Durations and steady_clock/high_resolution_clock time points need no
+   // XML-specific code: they are handled generically for every format
+   // (including XML) by core/chrono.hpp, since they carry no calendar
+   // semantics and serialize as a bare numeric count.
+   "duration_writes_the_bare_count"_test = [] {
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(milliseconds{1500}, "d").value_or("<error>");
+      expect(out == "<d>1500</d>") << out;
+   };
+
+   // Calendar types delegate to the shared chrono_detail ISO 8601 writers so XML
+   // matches the lexical form every other Glaze text format uses.
+   "chrono_calendar_types_write_iso8601_text"_test = [] {
+      const xml_chrono_holder h{.at = time_point_cast<seconds>(sys_days{2024y / 12 / 13} + 15h + 30min + 45s),
+                                .day = sys_days{2024y / 12 / 13},
+                                .ymd = 2024y / 12 / 13};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      // sys_days (period == days) writes date-only, matching every other format.
+      expect(out == "<h><at>2024-12-13T15:30:45Z</at><day>2024-12-13</day><ymd>2024-12-13</ymd></h>") << out;
    };
 };
 

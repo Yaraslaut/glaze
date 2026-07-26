@@ -7,6 +7,7 @@
 #include <concepts>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 #include "glaze/core/buffer_traits.hpp"
 #include "glaze/core/chrono.hpp"
@@ -18,6 +19,7 @@
 #include "glaze/core/write_chars.hpp"
 #include "glaze/util/dump.hpp"
 #include "glaze/util/for_each.hpp"
+#include "glaze/util/variant.hpp"
 #include "glaze/xml/common.hpp"
 
 namespace glz
@@ -120,6 +122,90 @@ namespace glz
                                   std::forward<Args>(args)...);
       }
    };
+
+   // Engaged optionals/pointers recurse into the held value. The disengaged case is
+   // deliberately not handled here: only the object writer (below) can suppress the
+   // surrounding <key>/</key> tags entirely (skip_null_members), so that decision --
+   // skip the member, or emit <key></key> -- lives there. A disengaged nullable
+   // reached any other way (the document root, a variant alternative, ...) simply
+   // has no body to write, which write_wrapped_element already renders as an empty
+   // element.
+   template <nullable_like T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class... Args>
+      static void op(auto&& value, is_context auto&& ctx, Args&&... args)
+      {
+         if (value) {
+            serialize<XML>::op<Opts>(*value, ctx, std::forward<Args>(args)...);
+         }
+      }
+   };
+
+   // std::visit onto the active alternative -- mirrors the TOML writer
+   // (toml/write.hpp:1461-1475). The active alternative is written exactly as if it
+   // had been the member's declared type, so a variant<int, string> member writes
+   // either a numeric or text body under the same element name.
+   template <is_variant T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class... Args>
+      static void op(auto&& value, is_context auto&& ctx, Args&&... args)
+      {
+         std::visit(
+            [&](auto&& alt) {
+               using V = std::decay_t<decltype(alt)>;
+               to<XML, V>::template op<Opts>(alt, ctx, std::forward<Args>(args)...);
+            },
+            value);
+      }
+   };
+
+   // std::chrono::system_clock time points and year_month_day: ISO 8601 text
+   // content, sharing the digit layout with every other Glaze format via
+   // chrono_detail (glaze/core/chrono.hpp). Durations and steady_clock /
+   // high_resolution_clock time points need no XML-specific code at all -- they
+   // are handled generically for every format (including XML) by the
+   // Format-parameterized to<Format, is_duration T> / to<Format, is_count_time_point
+   // T> specializations in that same header, since they serialize as a bare numeric
+   // count with no calendar semantics to render as text. Only the calendar types
+   // below need a format-specific (unquoted, unlike JSON) representation.
+   //
+   // Neither type satisfies xml_writes_own_start_tag_close, so write_wrapped_element
+   // treats them like any other scalar: '>' is written immediately, and this op only
+   // ever produces body text.
+   template <is_system_time_point T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         using Period = typename std::remove_cvref_t<T>::duration::period;
+         constexpr size_t max_size = chrono_detail::iso_time_point_max_size<Period> + write_padding_bytes;
+         if (!ensure_space(ctx, b, ix + max_size)) [[unlikely]] {
+            return;
+         }
+         chrono_detail::write_iso_time_point<false>(value, ctx, b, ix);
+      }
+   };
+
+   template <is_year_month_day T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         if (!ensure_space(ctx, b, ix + chrono_detail::iso_date_max_size + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         chrono_detail::write_iso_date<false>(static_cast<int>(value.year()), static_cast<unsigned>(value.month()),
+                                              static_cast<unsigned>(value.day()), ctx, b, ix);
+      }
+   };
 }
 
 namespace glz::xml::detail
@@ -156,6 +242,22 @@ namespace glz::xml::detail
       append_raw("<", ctx, b, ix);
       append_raw(name, ctx, b, ix);
 
+      // Prettify child-element bookkeeping. `ctx.wrote_element_child` is a
+      // single-frame accumulator: the loop sites below (the object writer's
+      // element pass, write_sequence, and the map writer) set it to true right
+      // before emitting each child of the value being written here. Save the
+      // caller's value and reset it before writing this value's body, so a
+      // nested element's own bookkeeping can never clobber the caller's; read it
+      // back right after to learn whether THIS body had element children (an
+      // indent belongs before the closing tag) or was plain text/scalar content
+      // (no whitespace added -- doing so would alter the text).
+      [[maybe_unused]] bool saved_wrote_child = false;
+      if constexpr (check_prettify(Opts)) {
+         saved_wrote_child = ctx.wrote_element_child;
+         ctx.wrote_element_child = false;
+         ++ctx.indent_depth;
+      }
+
       if constexpr (xml_writes_own_start_tag_close<V>) {
          serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
       }
@@ -164,11 +266,23 @@ namespace glz::xml::detail
          serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
       }
 
+      [[maybe_unused]] bool had_element_children = false;
+      if constexpr (check_prettify(Opts)) {
+         --ctx.indent_depth;
+         had_element_children = ctx.wrote_element_child;
+         ctx.wrote_element_child = saved_wrote_child;
+      }
+
       // Mirror the JSON writer (json/write.hpp:200,314,436): don't close a tag
       // whose body failed to serialize. Emitting </name> anyway leaves a
       // syntactically valid but semantically bogus element in the caller's
       // buffer, indistinguishable from a legitimately empty one.
       if (not bool(ctx.error)) [[likely]] {
+         if constexpr (check_prettify(Opts)) {
+            if (had_element_children) {
+               append_indent<Opts>(ctx, b, ix);
+            }
+         }
          append_raw("</", ctx, b, ix);
          append_raw(name, ctx, b, ix);
          append_raw(">", ctx, b, ix);
@@ -190,6 +304,10 @@ namespace glz::xml::detail
       for (auto&& item : value) {
          if (bool(ctx.error)) [[unlikely]] {
             return;
+         }
+         if constexpr (check_prettify(Opts)) {
+            append_indent<Opts>(ctx, b, ix);
+            ctx.wrote_element_child = true;
          }
          write_wrapped_element<Opts>(name, item, ctx, b, ix);
       }
@@ -298,6 +416,18 @@ namespace glz
                xml::detail::write_sequence<Opts>(key, member.template operator()<I>(), ctx, b, ix);
             }
             else {
+               // A disengaged nullable member: the object writer is the only place
+               // that can suppress the surrounding <key>/</key> tags entirely, so
+               // that decision -- skip when skip_null_members, else fall through
+               // and let write_wrapped_element emit <key></key> -- lives here
+               // rather than in to<XML, nullable_like>.
+               if (skip_member<Opts>(member.template operator()<I>())) {
+                  return;
+               }
+               if constexpr (xml::check_prettify(Opts)) {
+                  xml::detail::append_indent<Opts>(ctx, b, ix);
+                  ctx.wrote_element_child = true;
+               }
                xml::detail::write_wrapped_element<Opts>(key, member.template operator()<I>(), ctx, b, ix);
             }
          });
@@ -354,6 +484,10 @@ namespace glz
                   return;
                }
             }
+            if constexpr (xml::check_prettify(Opts)) {
+               xml::detail::append_indent<Opts>(ctx, b, ix);
+               ctx.wrote_element_child = true;
+            }
             xml::detail::write_wrapped_element<Opts>(key_sv, mapped, ctx, b, ix);
          }
       }
@@ -404,6 +538,12 @@ namespace glz
 
       if constexpr (xml::check_write_declaration(Opts)) {
          xml::detail::append_raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>", ctx, buffer, ix);
+         // The root element is always at indent_depth 0, so a bare '\n' (no spaces)
+         // is exactly what append_indent would produce -- write it directly rather
+         // than paying for a value read of ctx.indent_depth that is guaranteed 0.
+         if constexpr (xml::check_prettify(Opts)) {
+            xml::detail::append_raw("\n", ctx, buffer, ix);
+         }
       }
 
       // write_wrapped_element owns tag emission for both scalars and objects
