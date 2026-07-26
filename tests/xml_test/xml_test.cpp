@@ -1909,4 +1909,127 @@ suite generic_whitespace_collapse = [] {
    };
 };
 
+struct xml_ns_doc
+{
+   std::string title{};
+};
+
+template <>
+struct glz::meta<xml_ns_doc>
+{
+   using T = xml_ns_doc;
+   // Prefixes are retained verbatim in keys.
+   static constexpr auto value = object("d:title", &T::title);
+};
+
+suite namespaces_and_dtd = [] {
+   "prefixed_names_bind_by_literal_key"_test = [] {
+      xml_ns_doc d{};
+      const std::string xml = R"(<d:doc xmlns:d="urn:d"><d:title>T</d:title></d:doc>)";
+      const auto ec = glz::read_xml(d, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(d.title == "T");
+   };
+
+   "xmlns_declarations_are_not_treated_as_data_attributes"_test = [] {
+      // xmlns:* must not surface as an "@xmlns:d" member and so must not
+      // trigger unknown_key.
+      xml_ns_doc d{};
+      const auto ec = glz::read_xml(d, std::string{R"(<d:doc xmlns:d="urn:d"><d:title>T</d:title></d:doc>)"});
+      expect(!ec);
+   };
+
+   "undeclared_prefix_rejected"_test = [] {
+      glz::generic g{};
+      const auto ec = glz::read_xml(g, std::string{"<d:doc><d:title>T</d:title></d:doc>"});
+      expect(bool(ec)) << "an undeclared namespace prefix is an error";
+   };
+
+   "prefix_scope_ends_with_its_element"_test = [] {
+      glz::generic g{};
+      const std::string xml = R"(<r><a xmlns:p="urn:p"><p:x/></a><p:y/></r>)";
+      const auto ec = glz::read_xml(g, xml);
+      expect(bool(ec)) << "p is out of scope on <p:y/>";
+   };
+
+   "default_namespace_is_accepted"_test = [] {
+      glz::generic g{};
+      const auto ec = glz::read_xml(g, std::string{R"(<doc xmlns="urn:default"><title>T</title></doc>)"});
+      expect(!ec) << "a default namespace declaration is not a prefix binding";
+   };
+
+   "reserved_prefixes"_test = [] {
+      glz::generic g{};
+      // 'xml' is bound implicitly and need not be declared.
+      expect(!glz::read_xml(g, std::string{R"(<r xml:lang="en"><a/></r>)"}));
+      // Rebinding 'xml' to a different URI is forbidden.
+      expect(bool(glz::read_xml(g, std::string{R"(<r xmlns:xml="urn:wrong"><a/></r>)"})));
+      // 'xmlns' may never be bound.
+      expect(bool(glz::read_xml(g, std::string{R"(<r xmlns:xmlns="urn:x"><a/></r>)"})));
+   };
+
+   "colon_rules"_test = [] {
+      glz::generic g{};
+      expect(bool(glz::read_xml(g, std::string{R"(<a:b:c xmlns:a="urn:a"/>)"}))) << "two colons is not a QName";
+      expect(bool(glz::read_xml(g, std::string{R"(<:a/>)"})));
+      expect(bool(glz::read_xml(g, std::string{R"(<a:/>)"})));
+   };
+
+   "internal_dtd_subset_is_skipped"_test = [] {
+      xml_book b{};
+      const std::string xml =
+         "<!DOCTYPE book [\n"
+         "  <!ELEMENT book (title, year)>\n"
+         "  <!ATTLIST book id CDATA #IMPLIED>\n"
+         "]>\n"
+         "<book><title>Dune</title><year>1965</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "Dune");
+   };
+
+   "doctype_without_subset_is_skipped"_test = [] {
+      xml_book b{};
+      const auto ec = glz::read_xml(b, std::string{"<!DOCTYPE book><book><title>T</title><year>1</year></book>"});
+      expect(!ec);
+      expect(b.title == "T");
+   };
+
+   "dtd_declared_entity_is_still_undeclared_to_us"_test = [] {
+      // We skip rather than expand the internal subset, so a reference to an
+      // entity declared there is an error rather than a silent pass.
+      xml_book b{};
+      const std::string xml =
+         "<!DOCTYPE book [<!ENTITY e \"x\">]>"
+         "<book><title>&e;</title><year>1</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(bool(ec)) << "undeclared-to-us entity must error, not silently pass";
+   };
+
+   "external_dtd_is_never_fetched"_test = [] {
+      xml_book b{};
+      const std::string xml =
+         "<!DOCTYPE book SYSTEM \"http://example.invalid/book.dtd\">"
+         "<book><title>T</title><year>1</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      // Parsing succeeds; the external subset is ignored, never retrieved.
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "T");
+   };
+
+   "dtd_with_nested_brackets_and_strings"_test = [] {
+      xml_book b{};
+      const std::string xml =
+         "<!DOCTYPE book [<!ENTITY e \"a]b\"><!-- ] --><?pi ]?>]>"
+         "<book><title>T</title><year>1</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << "']' inside strings, comments, and PIs must not end the subset";
+   };
+
+   "unterminated_dtd_rejected"_test = [] {
+      xml_book b{};
+      expect(bool(glz::read_xml(b, std::string{"<!DOCTYPE book [<!ELEMENT book ANY>"})));
+   };
+};
+
 int main() {}

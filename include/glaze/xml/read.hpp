@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -56,16 +57,28 @@ namespace glz::xml
    }
 
    // Peeks whether the upcoming element (`it` must be at '<') is "empty" for
-   // nullable_like purposes: it must carry no attributes, and be either
+   // nullable_like purposes: it must carry no DATA attributes, and be either
    // self-closing ("<name/>") or non-self-closing with zero characters of
-   // content ("<name></name>"). An element with attributes is never empty,
-   // even if self-closing or content-free -- the attributes are data that a
-   // disengaged nullable would silently drop. Like peek_element_name above,
-   // this is a pure classifier -- it never touches `it` or ctx, so
-   // from<XML, nullable_like T> can decide which branch to take before
-   // committing to a real, error-reporting parse. A malformed or truncated
-   // tag simply reports false (not empty); the real parse that follows in
-   // either branch is what actually rejects it.
+   // content ("<name></name>"). An element with data attributes is never
+   // empty, even if self-closing or content-free -- the attributes are data
+   // that a disengaged nullable would silently drop.
+   //
+   // 'xmlns' and 'xmlns:*' declarations are namespace metadata, not data (see
+   // xml::parse_start_tag's attribute::is_namespace_decl), so an element
+   // carrying only those -- e.g. "<a xmlns:p="urn:p"/>" -- is deliberately
+   // still classified as empty here: this mirrors every other attribute
+   // consumer (the reflected-object and generic readers' "@name" binding, the
+   // map reader's attribute check), all of which likewise treat a namespace
+   // declaration as carrying no data. Since the classification only reads
+   // raw attribute names (it does not resolve prefixes or track scope), a
+   // name is recognised as a declaration by shape alone: exactly "xmlns", or
+   // starting with "xmlns:".
+   //
+   // Like peek_element_name above, this is a pure classifier -- it never
+   // touches `it` or ctx, so from<XML, nullable_like T> can decide which
+   // branch to take before committing to a real, error-reporting parse. A
+   // malformed or truncated tag simply reports false (not empty); the real
+   // parse that follows in either branch is what actually rejects it.
    inline bool peek_is_empty_element(const char* it, const char* end) noexcept
    {
       if (it >= end || *it != '<') {
@@ -103,7 +116,9 @@ namespace glz::xml
          if (attr_name.empty()) {
             return false;
          }
-         has_attributes = true;
+         if (attr_name != "xmlns" && !attr_name.starts_with("xmlns:")) {
+            has_attributes = true;
+         }
          skip_whitespace(p, end);
          if (p >= end || *p != '=') {
             return false;
@@ -513,7 +528,12 @@ namespace glz
             return;
          }
 
-         if (!tag.attributes.empty()) {
+         // xmlns declarations are namespace metadata, not data -- see
+         // xml::attribute::is_namespace_decl -- so they do not count as an
+         // attribute a map (which has no member to bind one to) must reject.
+         const bool has_data_attribute = std::any_of(tag.attributes.begin(), tag.attributes.end(),
+                                                     [](const auto& attr) { return !attr.is_namespace_decl; });
+         if (has_data_attribute) {
             if constexpr (Opts.error_on_unknown_keys) {
                ctx.error = error_code::unknown_key; // a map has no member to bind an attribute to
                return;
@@ -708,8 +728,14 @@ namespace glz
             return;
          }
 
-         const bool any_attr = !tag.attributes.empty();
+         // xmlns declarations are namespace metadata, not data (see
+         // xml::attribute::is_namespace_decl): they do not surface as an
+         // "@xmlns:*" member and do not count toward "this element carries
+         // attributes" for the bare-string collapse below.
+         bool any_attr = false;
          for (const auto& attr : tag.attributes) {
+            if (attr.is_namespace_decl) continue;
+            any_attr = true;
             std::string key;
             key.reserve(attr.name.size() + 1);
             key += '@';
@@ -851,7 +877,12 @@ namespace glz
          bit_array<N> assigned{};
 
          // Bind attributes: "@" + attr.name looked up against reflect<V>::keys.
+         // xmlns declarations are namespace metadata, not data (see
+         // xml::attribute::is_namespace_decl), and are skipped here so an
+         // "xmlns:d" declaration never surfaces as an "@xmlns:d" member and
+         // so never trips unknown_key.
          for (const auto& attr : tag.attributes) {
+            if (attr.is_namespace_decl) continue;
             if (bool(ctx.error)) [[unlikely]] {
                return;
             }

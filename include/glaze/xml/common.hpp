@@ -508,6 +508,12 @@ namespace glz::xml
    {
       std::string name;
       std::string value;
+      // True for 'xmlns' and 'xmlns:*' -- namespace declarations, not data.
+      // parse_start_tag sets this; every attribute-consuming site (the
+      // reflected-object and generic readers' "@name" binding, the map
+      // reader's "a map has no attributes" check, ...) must skip attributes
+      // so marked rather than offering them to the member binder.
+      bool is_namespace_decl{};
    };
 
    struct start_tag
@@ -739,6 +745,24 @@ namespace glz::xml
       return true;
    }
 
+   namespace detail
+   {
+      // Reads a maximal run of NameChar starting at 'p'. Does not itself verify
+      // that the result is a well-formed Name (i.e. that the first character is
+      // a NameStartChar) -- callers pass the result through validate_name.
+      inline std::string_view read_name_span(const char*& p, const char* end) noexcept
+      {
+         const char* const begin = p;
+         while (p < end) {
+            char32_t cp{};
+            const size_t n = decode_utf8(p, end, cp);
+            if (n == 0 || !is_name_char(cp)) break;
+            p += n;
+         }
+         return std::string_view{begin, size_t(p - begin)};
+      }
+   }
+
    // Walks the buffer with decode_utf8 and reports the byte offset of the
    // first malformed sequence.
    inline bool validate_utf8(std::string_view s, size_t& bad_offset) noexcept
@@ -757,10 +781,163 @@ namespace glz::xml
       return true;
    }
 
+   // doctypedecl ::= '<!DOCTYPE' S Name (S ExternalID)? S? ('[' intSubset ']' S?)? '>'
+   // ExternalID   ::= 'SYSTEM' S SystemLiteral | 'PUBLIC' S PubidLiteral S SystemLiteral
+   //
+   // Glaze skips rather than expands the internal subset -- an entity (or
+   // any other declaration) it contains is recorded nowhere, so a document
+   // that references one is rejected as if it were never declared at all
+   // (see decode_reference's "undeclared general entity" comment above). The
+   // external identifiers (SystemLiteral / PubidLiteral) are likewise
+   // scanned and discarded: they are never dereferenced, over the network or
+   // the filesystem, by this or any other reader-phase function.
+   //
+   // The '[' ... ']' scan below must not stop at the first ']' -- one may
+   // legitimately occur inside a quoted literal, a comment, or a processing
+   // instruction within the subset (the *_with_nested_brackets_and_strings
+   // test pins exactly this), so each of those is stepped over as a unit via
+   // parse_comment / parse_pi / matching-quote scanning, and only a ']' seen
+   // outside all three closes the subset. An unmatched '[' inside the
+   // subset (e.g. a conditional section) is tracked with a depth counter for
+   // the same reason.
+   inline bool skip_dtd(const char*& it, const char* end, xml_context& ctx) noexcept
+   {
+      constexpr std::string_view open = "<!DOCTYPE";
+      if (size_t(end - it) < open.size() || std::string_view{it, open.size()} != open) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+
+      const char* p = it + open.size();
+      if (p >= end || !is_whitespace(*p)) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      skip_whitespace(p, end);
+
+      const std::string_view root_name = detail::read_name_span(p, end);
+      if (!validate_name(root_name)) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+
+      const char* const before_ws = p;
+      skip_whitespace(p, end);
+      const bool had_ws = p != before_ws;
+
+      const auto starts_with = [&](std::string_view lit) noexcept -> bool {
+         return size_t(end - p) >= lit.size() && std::string_view{p, lit.size()} == lit;
+      };
+
+      // SystemLiteral ::= ('"' [^"]* '"') | ("'" [^']* "'")
+      // PubidLiteral, similarly quoted -- close enough for our purposes,
+      // since the content is discarded either way and never dereferenced.
+      const auto skip_literal = [&]() noexcept -> bool {
+         if (p >= end || (*p != '"' && *p != '\'')) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         const char quote = *p;
+         ++p;
+         while (p < end && *p != quote) {
+            ++p;
+         }
+         if (p >= end) {
+            ctx.error = error_code::unexpected_end;
+            return false;
+         }
+         ++p; // past closing quote
+         return true;
+      };
+
+      if (had_ws && starts_with("SYSTEM")) {
+         p += 6;
+         if (p >= end || !is_whitespace(*p)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         skip_whitespace(p, end);
+         if (!skip_literal()) return false;
+         skip_whitespace(p, end);
+      }
+      else if (had_ws && starts_with("PUBLIC")) {
+         p += 6;
+         if (p >= end || !is_whitespace(*p)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         skip_whitespace(p, end);
+         if (!skip_literal()) return false; // PubidLiteral
+         if (p >= end || !is_whitespace(*p)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         skip_whitespace(p, end);
+         if (!skip_literal()) return false; // SystemLiteral
+         skip_whitespace(p, end);
+      }
+
+      if (p < end && *p == '[') {
+         ++p;
+         size_t bracket_depth = 1;
+         while (bracket_depth > 0) {
+            if (p >= end) {
+               ctx.error = error_code::unexpected_end;
+               return false;
+            }
+            const char c = *p;
+            if (c == '"' || c == '\'') {
+               const char quote = c;
+               ++p;
+               while (true) {
+                  if (p >= end) {
+                     ctx.error = error_code::unexpected_end;
+                     return false;
+                  }
+                  if (*p == quote) {
+                     ++p;
+                     break;
+                  }
+                  ++p;
+               }
+            }
+            else if (c == '<' && size_t(end - p) >= 4 && std::string_view{p, 4} == "<!--") {
+               if (!parse_comment(p, end, ctx)) return false;
+            }
+            else if (c == '<' && size_t(end - p) >= 2 && p[1] == '?') {
+               if (!parse_pi(p, end, ctx)) return false;
+            }
+            else if (c == '[') {
+               ++bracket_depth;
+               ++p;
+            }
+            else if (c == ']') {
+               --bracket_depth;
+               ++p;
+            }
+            else {
+               ++p;
+            }
+         }
+         skip_whitespace(p, end);
+      }
+
+      if (p >= end) {
+         ctx.error = error_code::unexpected_end;
+         return false;
+      }
+      if (*p != '>') {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      ++p;
+
+      it = p;
+      return true;
+   }
+
    // Prolog ::= XMLDecl? Misc* (doctypedecl Misc*)?
-   // where Misc ::= Comment | PI | S. The internal DTD subset (doctypedecl) is
-   // added by a later task; for now parse_prolog simply stops at whatever '<'
-   // follows, leaving it positioned there.
+   // where Misc ::= Comment | PI | S.
    //
    // parse_pi and parse_xml_declaration both start with '<?', so the
    // declaration is only ever attempted here, at offset zero -- never inside
@@ -790,27 +967,13 @@ namespace glz::xml
             if (!parse_pi(it, end, ctx)) return false;
             continue;
          }
-         break; // the document element (or, later, a doctypedecl) starts here
+         if (size_t(end - it) >= 9 && std::string_view{it, 9} == "<!DOCTYPE") {
+            if (!skip_dtd(it, end, ctx)) return false;
+            continue;
+         }
+         break; // the document element starts here
       }
       return true;
-   }
-
-   namespace detail
-   {
-      // Reads a maximal run of NameChar starting at 'p'. Does not itself verify
-      // that the result is a well-formed Name (i.e. that the first character is
-      // a NameStartChar) -- callers pass the result through validate_name.
-      inline std::string_view read_name_span(const char*& p, const char* end) noexcept
-      {
-         const char* const begin = p;
-         while (p < end) {
-            char32_t cp{};
-            const size_t n = decode_utf8(p, end, cp);
-            if (n == 0 || !is_name_char(cp)) break;
-            p += n;
-         }
-         return std::string_view{begin, size_t(p - begin)};
-      }
    }
 
    // AttValue ::= '"' ([^<&"] | Reference)* '"' | "'" ([^<&'] | Reference)* "'"
@@ -949,7 +1112,85 @@ namespace glz::xml
       }
 
       it = p;
-      if (!out.self_closing) {
+
+      // Namespaces in XML 1.0: this element's scope opens here (and, for a
+      // non-self-closing element, remains open for everything nested inside
+      // it, until parse_end_tag closes it back). A self-closing element has
+      // no separate closing event, so its own scope is opened and closed
+      // right here.
+      ctx.push_ns_scope();
+
+      // Pass 1: collect every 'xmlns' / 'xmlns:p' declaration in this start
+      // tag and bind it, BEFORE resolving any qualified name below -- a
+      // prefix declared later in the same tag still applies to an earlier
+      // attribute in that tag, because all declarations in a start tag are
+      // in scope for the whole tag, not just what follows them textually.
+      // Each such attribute is marked is_namespace_decl so it is never
+      // offered to the member binder as ordinary data.
+      for (auto& attr : out.attributes) {
+         if (attr.name == "xmlns") {
+            attr.is_namespace_decl = true;
+            ctx.bind_prefix("", attr.value); // default namespace
+            continue;
+         }
+         if (attr.name.starts_with("xmlns:")) {
+            attr.is_namespace_decl = true;
+            const std::string_view prefix = std::string_view{attr.name}.substr(6);
+            if (prefix.empty() || !validate_ncname(prefix)) {
+               ctx.error = error_code::syntax_error;
+               return false;
+            }
+            if (prefix == "xmlns") {
+               ctx.error = error_code::syntax_error; // the 'xmlns' prefix may never be bound
+               return false;
+            }
+            if (prefix == "xml" && attr.value != "http://www.w3.org/XML/1998/namespace") {
+               ctx.error = error_code::syntax_error; // rebinding 'xml' to another URI is forbidden
+               return false;
+            }
+            ctx.bind_prefix(prefix, attr.value);
+         }
+      }
+
+      // Splits a qualified name at its first ':' and validates it: with no
+      // colon, 'qname' was already checked as a Name by the caller and needs
+      // nothing further; with one, both halves must be NCNames (this is what
+      // rejects "a:b:c" -- the local half "b:c" contains a colon and so
+      // fails validate_ncname -- as well as ":a" and "a:", whose empty half
+      // fails validate_name), and the prefix must resolve in the scope just
+      // built above, except 'xml', which is implicitly bound.
+      const auto check_qname = [&](std::string_view qname) noexcept -> bool {
+         const auto colon = qname.find(':');
+         if (colon == std::string_view::npos) {
+            return true;
+         }
+         const std::string_view prefix = qname.substr(0, colon);
+         const std::string_view local = qname.substr(colon + 1);
+         if (!validate_ncname(prefix) || !validate_ncname(local)) {
+            return false;
+         }
+         if (prefix == "xml") {
+            return true;
+         }
+         return !ctx.resolve_prefix(prefix).empty();
+      };
+
+      if (!check_qname(out.name)) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      for (const auto& attr : out.attributes) {
+         if (attr.is_namespace_decl) continue;
+         if (!check_qname(attr.name)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+      }
+
+      if (out.self_closing) {
+         ctx.pop_ns_scope();
+      }
+      else {
          if (!ctx.push_element(out.name)) {
             return false;
          }
@@ -983,6 +1224,10 @@ namespace glz::xml
       if (!ctx.pop_element(name_view)) {
          return false;
       }
+      // Mirrors the push in parse_start_tag: a non-self-closing element's
+      // namespace scope stays open until its own end tag, so any prefix it
+      // (or an attribute on it) declared stops resolving right here.
+      ctx.pop_ns_scope();
 
       name = name_view;
       it = p;
