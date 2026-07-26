@@ -2257,6 +2257,20 @@ suite nullable_variant_prettify = [] {
          << out;
    };
 
+   "prettify_does_not_corrupt_mixed_content"_test = [] {
+      // An element with BOTH #text and element children. Indenting it would
+      // append the newline and indent to the text value -- #text becomes
+      // "HELLO\n   " instead of "HELLO", silent corruption on read-back.
+      const xml_mixed m{.text = "HELLO", .child = "c"};
+      const auto compact =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(m, "m").value_or("<error>");
+      const auto pretty =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(m, "m")
+            .value_or("<error>");
+      expect(compact == "<m>HELLO<child>c</child></m>") << compact;
+      expect(pretty == compact) << "mixed content must be written compactly even with prettify: " << pretty;
+   };
+
    "prettify_does_not_add_whitespace_to_text_content"_test = [] {
       // Indenting an element that holds text would change that text's value.
       const xml_user u{.id = 1, .role = "r", .text = "Alice"};
@@ -2298,10 +2312,18 @@ Expected: FAIL — optionals and variants do not compile.
   XML matches the other formats; these land in the XSD mapping in Task 21.
 - **prettify**: track depth in `xml_context`. Before each *child element* emit
   `\n` plus `indentation_width * depth` spaces; before the closing tag of an
-  element that has element children, emit `\n` plus the parent indent. An
-  element whose content is text or a scalar gets no added whitespace — this is
-  the `prettify_does_not_add_whitespace_to_text_content` case, and getting it
-  wrong silently corrupts data.
+  element that has element children, emit `\n` plus the parent indent.
+  **Whitespace must never enter an element that carries text.** Two cases:
+  - text-only / scalar content: no added whitespace at all;
+  - **mixed content** — an element with BOTH a `#text` member and element
+    members — must also be written compactly. Indenting it appends the newline
+    and indent to the text value: `<m>HELLO<child>c</child></m>` becomes
+    `#text == "HELLO\n   "`, silent corruption on read-back. The object writer
+    knows at compile time whether `T` has a `#text` member, so suppress
+    prettify for that element's body when it does.
+
+  Testing only the text-only case is insufficient — it passes while mixed
+  content is still corrupted.
 
 - [ ] **Step 4: Run test to verify it passes**
 
