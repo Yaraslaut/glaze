@@ -463,4 +463,57 @@ suite xml_context_tests = [] {
    };
 };
 
+// Writes a bare scalar with the declaration suppressed, so the test asserts on
+// the scalar's lexical form alone.
+template <class T>
+static std::string write_scalar(T&& v)
+{
+   return glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(std::forward<T>(v)).value_or("<error>");
+}
+
+enum struct color { red, green, blue };
+
+template <>
+struct glz::meta<color>
+{
+   static constexpr auto value = enumerate(color::red, color::green, color::blue);
+};
+
+suite scalar_writing = [] {
+   "write_bool"_test = [] {
+      // XSD boolean lexical space is "true"/"false", never 1/0.
+      expect(write_scalar(true) == "<root>true</root>");
+      expect(write_scalar(false) == "<root>false</root>");
+   };
+
+   "write_integers"_test = [] {
+      expect(write_scalar(0) == "<root>0</root>");
+      expect(write_scalar(42) == "<root>42</root>");
+      expect(write_scalar(-7) == "<root>-7</root>");
+      expect(write_scalar(int64_t{-9223372036854775807LL - 1}) == "<root>-9223372036854775808</root>");
+      expect(write_scalar(uint64_t{18446744073709551615ULL}) == "<root>18446744073709551615</root>");
+   };
+
+   "write_floats"_test = [] {
+      expect(write_scalar(1.5) == "<root>1.5</root>");
+      expect(write_scalar(0.0) == "<root>0</root>");
+      expect(write_scalar(-2.25) == "<root>-2.25</root>");
+   };
+
+   "write_strings_are_escaped"_test = [] {
+      expect(write_scalar(std::string{"hello"}) == "<root>hello</root>");
+      expect(write_scalar(std::string{"a&b"}) == "<root>a&amp;b</root>");
+      expect(write_scalar(std::string{"a<b"}) == "<root>a&lt;b</root>");
+      expect(write_scalar(std::string{"]]>"}) == "<root>]]&gt;</root>");
+      expect(write_scalar(std::string{""}) == "<root></root>");
+   };
+
+   "write_enum_as_name"_test = [] { expect(write_scalar(color::green) == "<root>green</root>"); };
+
+   "write_declaration_default_on"_test = [] {
+      const auto s = glz::write_xml(42).value_or("<error>");
+      expect(s == "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root>42</root>") << s;
+   };
+};
+
 int main() {}
