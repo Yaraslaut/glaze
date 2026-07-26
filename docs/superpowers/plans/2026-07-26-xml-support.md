@@ -2009,7 +2009,11 @@ git commit -m "feat(xml): write reflected objects with @attr and #text mapping"
 
 **Interfaces:**
 - Consumes: Task 6 object writing.
-- Produces: `to<XML, T>` for `readable_array_t` (sequences) and `readable_map_t` (maps).
+- Produces: `to<XML, T>` for `writable_array_t` (sequences) and `writable_map_t` (maps).
+  Note the `writable_` prefix: `readable_array_t` / `readable_map_t` exclude
+  `custom_read`, which is the wrong side for a writer, and would fail to
+  exclude `custom_write` types — reintroducing the double-specialization bug
+  class Task 6 fixed. Both the TOML and YAML writers use `writable_*`.
 
 A sequence member does **not** wrap its items in an extra container element.
 `std::vector<int> tag` inside `<root>` emits `<tag>1</tag><tag>2</tag>` — the
@@ -2122,15 +2126,15 @@ Expected: FAIL to compile — no `to<XML, T>` for sequences or maps.
 
 In `include/glaze/xml/write.hpp`:
 
-- For `readable_array_t T`: `op` receives the element name from the enclosing
+- For `writable_array_t T`: `op` receives the element name from the enclosing
   object writer. Thread it through as a runtime `std::string_view` parameter on
   an internal helper (not through `Opts`, which must stay structural). For each
   item emit `<name>`, recurse, `</name>`.
-- For `readable_map_t T`: for each pair, validate the key with
+- For `writable_map_t T`: for each pair, validate the key with
   `xml::validate_name` at runtime when `check_validate_names(Opts)`, setting
   `ctx.error = error_code::syntax_error` and returning on failure. Then emit
   `<key>`, recurse on the mapped value, `</key>`.
-- In `write_xml`, reject a top-level `readable_array_t` that is not wrapped in
+- In `write_xml`, reject a top-level `writable_array_t` that is not wrapped in
   an object by setting `error_code::syntax_error` with the message
   `"a sequence cannot be the document root; wrap it in a struct"`.
 
