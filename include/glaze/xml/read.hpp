@@ -507,6 +507,13 @@ namespace glz::xml
       return true;
    }
 
+   // Opening delimiter of a CDATA section (CDSect ::= '<![CDATA[' CData ']]>'),
+   // shared by every site that must recognise one: parse_cdata (which parses
+   // the whole section), parse_char_data (which must know when a leading '<'
+   // opens a CDATA section rather than markup), and any dispatch site that
+   // decides between element-dispatch and character data.
+   inline constexpr std::string_view cdata_open_tag = "<![CDATA[";
+
    // CData ::= (Char* - (Char* ']]>' Char*))
    // CDSect ::= '<![CDATA[' CData ']]>'
    //
@@ -517,7 +524,7 @@ namespace glz::xml
    // applies here even though CDATA otherwise suppresses markup recognition.
    inline bool parse_cdata(const char*& it, const char* end, xml_context& ctx, std::string& out) noexcept
    {
-      constexpr std::string_view open = "<![CDATA[";
+      constexpr std::string_view open = cdata_open_tag;
       if (size_t(end - it) < open.size() || std::string_view{it, open.size()} != open) {
          ctx.error = error_code::syntax_error;
          return false;
@@ -568,13 +575,13 @@ namespace glz::xml
    inline bool parse_char_data(const char*& it, const char* end, xml_context& ctx, std::string& out) noexcept
    {
       out.clear();
-      constexpr std::string_view cdata_open = "<![CDATA[";
 
       while (it < end) {
          const char c = *it;
 
          if (c == '<') {
-            if (size_t(end - it) >= cdata_open.size() && std::string_view{it, cdata_open.size()} == cdata_open) {
+            if (size_t(end - it) >= cdata_open_tag.size() &&
+                std::string_view{it, cdata_open_tag.size()} == cdata_open_tag) {
                if (!parse_cdata(it, end, ctx, out)) {
                   return false;
                }
@@ -660,13 +667,23 @@ namespace glz::xml
             ctx.error = error_code::unexpected_end;
             return false;
          }
-         if (*it != '<') {
-            std::string chunk;
-            if (!parse_char_data(it, end, ctx, chunk)) {
-               return false;
-            }
-            out += chunk;
-            continue;
+
+         // Route through parse_char_data unconditionally rather than only when
+         // 'it' is not at '<': it already recognises '<![CDATA[' as character
+         // data and merges it in, and returns immediately, without consuming,
+         // when '<' opens something else -- leaving 'it' there for the markup
+         // dispatch below. This is what lets a content run that *starts* with
+         // CDATA (e.g. "<title><![CDATA[Dune]]></title>") parse correctly,
+         // not just one where CDATA follows some leading text.
+         std::string chunk;
+         if (!parse_char_data(it, end, ctx, chunk)) {
+            return false;
+         }
+         out += chunk;
+
+         if (it == end) [[unlikely]] {
+            ctx.error = error_code::unexpected_end;
+            return false;
          }
          if (size_t(end - it) >= 2 && it[1] == '/') {
             return true; // caller parses the end tag
@@ -716,32 +733,44 @@ namespace glz::xml
             ctx.error = error_code::unexpected_end;
             return;
          }
-         if (*it == '<') {
-            if (size_t(end - it) >= 2 && it[1] == '/') {
-               std::string name;
-               parse_end_tag(it, end, ctx, name);
-               return;
-            }
-            if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
-               if (!parse_comment(it, end, ctx)) {
-                  return;
-               }
-               continue;
-            }
-            if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
-               if (!parse_pi(it, end, ctx)) {
-                  return;
-               }
-               continue;
-            }
-            skip_element(it, end, ctx);
-            if (bool(ctx.error)) [[unlikely]] {
+
+         // Route through parse_char_data unconditionally so that a CDATA
+         // section starting the content run (e.g. an unknown element skipped
+         // in lenient mode, "<nope><![CDATA[...]]></nope>") is consumed as
+         // character data rather than mistaken for a child element and
+         // hard-failing the whole document. parse_char_data leaves 'it'
+         // untouched, at '<', when that '<' opens something else.
+         std::string chunk;
+         if (!parse_char_data(it, end, ctx, chunk)) {
+            return;
+         }
+
+         if (it == end) [[unlikely]] {
+            ctx.error = error_code::unexpected_end;
+            return;
+         }
+         // parse_char_data only ever stops, without consuming, at a '<' that
+         // does not open a CDATA section, so 'it' is guaranteed to sit at '<'
+         // here.
+         if (size_t(end - it) >= 2 && it[1] == '/') {
+            std::string name;
+            parse_end_tag(it, end, ctx, name);
+            return;
+         }
+         if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
+            if (!parse_comment(it, end, ctx)) {
                return;
             }
             continue;
          }
-         std::string chunk;
-         if (!parse_char_data(it, end, ctx, chunk)) {
+         if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
+            if (!parse_pi(it, end, ctx)) {
+               return;
+            }
+            continue;
+         }
+         skip_element(it, end, ctx);
+         if (bool(ctx.error)) [[unlikely]] {
             return;
          }
       }
@@ -1130,72 +1159,14 @@ namespace glz
                ctx.error = error_code::unexpected_end;
                return;
             }
-            if (*it == '<') {
-               if (size_t(end - it) >= 2 && it[1] == '/') {
-                  std::string end_name;
-                  if (!xml::parse_end_tag(it, end, ctx, end_name)) {
-                     return;
-                  }
-                  break;
-               }
-               if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
-                  if (!xml::parse_comment(it, end, ctx)) {
-                     return;
-                  }
-                  continue;
-               }
-               if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
-                  if (!xml::parse_pi(it, end, ctx)) {
-                     return;
-                  }
-                  continue;
-               }
 
-               const std::string_view child_name = xml::peek_element_name(it, end);
-               const auto index = decode_hash_with_size<XML, V, HashInfo, HashInfo.type>::op(
-                  child_name.data(), child_name.data() + child_name.size(), child_name.size());
-               const bool key_matches = index < N && child_name == reflect<V>::keys[index];
-
-               if (key_matches) [[likely]] {
-                  visit<N>(
-                     [&]<size_t I>() {
-                        using member_t = std::remove_cvref_t<decltype(member.template operator()<I>())>;
-                        if constexpr (readable_array_t<member_t> && emplace_backable<member_t>) {
-                           // Repeated-sibling convention (mirrors write_sequence in
-                           // xml/write.hpp): every occurrence appends one item.
-                           // from<XML, item_t> parses exactly one item; it never loops.
-                           assigned[I] = true;
-                           auto& item = member.template operator()<I>().emplace_back();
-                           using item_t = std::remove_cvref_t<decltype(item)>;
-                           from<XML, item_t>::template op<Opts>(item, ctx, it, end);
-                        }
-                        else {
-                           if (assigned[I]) {
-                              ctx.error = error_code::duplicate_key;
-                              return;
-                           }
-                           assigned[I] = true;
-                           from<XML, member_t>::template op<Opts>(member.template operator()<I>(), ctx, it, end);
-                        }
-                     },
-                     index);
-                  if (bool(ctx.error)) [[unlikely]] {
-                     return;
-                  }
-               }
-               else if constexpr (Opts.error_on_unknown_keys) {
-                  ctx.error = error_code::unknown_key;
-                  return;
-               }
-               else {
-                  xml::skip_element(it, end, ctx);
-                  if (bool(ctx.error)) [[unlikely]] {
-                     return;
-                  }
-               }
-               continue;
-            }
-
+            // Route through parse_char_data unconditionally, before testing
+            // for '<' at all: it already recognises '<![CDATA[' as character
+            // data and merges it in, and returns immediately, without
+            // consuming, when '<' opens something else -- leaving 'it' there
+            // for the markup dispatch below. This is what lets a content run
+            // that *starts* with CDATA parse correctly, not just one where
+            // CDATA follows some leading text.
             std::string chunk;
             if (!xml::parse_char_data(it, end, ctx, chunk)) {
                return;
@@ -1207,6 +1178,75 @@ namespace glz
             else if (!xml::is_whitespace_only(chunk)) {
                if constexpr (Opts.error_on_unknown_keys) {
                   ctx.error = error_code::unknown_key;
+                  return;
+               }
+            }
+
+            if (it == end) [[unlikely]] {
+               ctx.error = error_code::unexpected_end;
+               return;
+            }
+            // 'it' is guaranteed to sit at '<' here, and not at a CDATA-open
+            // (parse_char_data already consumed those).
+            if (size_t(end - it) >= 2 && it[1] == '/') {
+               std::string end_name;
+               if (!xml::parse_end_tag(it, end, ctx, end_name)) {
+                  return;
+               }
+               break;
+            }
+            if (size_t(end - it) >= 4 && std::string_view{it, 4} == "<!--") {
+               if (!xml::parse_comment(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+            if (size_t(end - it) >= 2 && std::string_view{it, 2} == "<?") {
+               if (!xml::parse_pi(it, end, ctx)) {
+                  return;
+               }
+               continue;
+            }
+
+            const std::string_view child_name = xml::peek_element_name(it, end);
+            const auto index = decode_hash_with_size<XML, V, HashInfo, HashInfo.type>::op(
+               child_name.data(), child_name.data() + child_name.size(), child_name.size());
+            const bool key_matches = index < N && child_name == reflect<V>::keys[index];
+
+            if (key_matches) [[likely]] {
+               visit<N>(
+                  [&]<size_t I>() {
+                     using member_t = std::remove_cvref_t<decltype(member.template operator()<I>())>;
+                     if constexpr (readable_array_t<member_t> && emplace_backable<member_t>) {
+                        // Repeated-sibling convention (mirrors write_sequence in
+                        // xml/write.hpp): every occurrence appends one item.
+                        // from<XML, item_t> parses exactly one item; it never loops.
+                        assigned[I] = true;
+                        auto& item = member.template operator()<I>().emplace_back();
+                        using item_t = std::remove_cvref_t<decltype(item)>;
+                        from<XML, item_t>::template op<Opts>(item, ctx, it, end);
+                     }
+                     else {
+                        if (assigned[I]) {
+                           ctx.error = error_code::duplicate_key;
+                           return;
+                        }
+                        assigned[I] = true;
+                        from<XML, member_t>::template op<Opts>(member.template operator()<I>(), ctx, it, end);
+                     }
+                  },
+                  index);
+               if (bool(ctx.error)) [[unlikely]] {
+                  return;
+               }
+            }
+            else if constexpr (Opts.error_on_unknown_keys) {
+               ctx.error = error_code::unknown_key;
+               return;
+            }
+            else {
+               xml::skip_element(it, end, ctx);
+               if (bool(ctx.error)) [[unlikely]] {
                   return;
                }
             }

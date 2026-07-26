@@ -1650,4 +1650,53 @@ suite struct_reading = [] {
    };
 };
 
+suite cdata_in_content = [] {
+   "cdata_only_leaf_value"_test = [] {
+      // A leaf wrapped entirely in CDATA -- the commonest real-world use.
+      // Rejected before the fix: the dispatch tested for end-tag/comment/PI and
+      // fell through to a syntax error without testing for "<![CDATA[".
+      xml_book b{};
+      const std::string xml = "<book><title><![CDATA[Dune]]></title><year>1965</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "Dune") << b.title;
+      expect(b.year == 1965);
+   };
+
+   "cdata_then_text"_test = [] {
+      xml_book b{};
+      const std::string xml = "<book><title><![CDATA[Du]]>ne</title><year>1965</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "Dune") << b.title;
+   };
+
+   "text_then_cdata_still_works"_test = [] {
+      xml_book b{};
+      const std::string xml = "<book><title>Du<![CDATA[ne]]></title><year>1965</year></book>";
+      expect(!glz::read_xml(b, xml));
+      expect(b.title == "Dune") << b.title;
+   };
+
+   "cdata_preserves_markup_characters"_test = [] {
+      xml_book b{};
+      const std::string xml = "<book><title><![CDATA[a<b&c]]></title><year>1</year></book>";
+      const auto ec = glz::read_xml(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "a<b&c") << b.title;
+   };
+
+   "unknown_subtree_containing_cdata_is_skipped"_test = [] {
+      // The skipper must consume the whole unknown subtree. Before the fix it
+      // hard-failed the entire document, defeating lenient mode.
+      xml_book b{};
+      const std::string xml =
+         "<book><title>T</title><nope><![CDATA[whatever <ignored/> &raw;]]></nope><year>1</year></book>";
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(b, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(b.title == "T");
+      expect(b.year == 1) << "the skipper must consume past the CDATA to reach <year>";
+   };
+};
+
 int main() {}
