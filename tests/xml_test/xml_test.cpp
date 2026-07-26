@@ -255,7 +255,6 @@ suite entities_and_escaping = [] {
    "numeric_character_references"_test = [decode_all] {
       expect(decode_all("&#65;") == std::pair{true, std::string{"A"}});
       expect(decode_all("&#x41;") == std::pair{true, std::string{"A"}});
-      expect(decode_all("&#X41;") == std::pair{true, std::string{"A"}});
       expect(decode_all("&#233;") == std::pair{true, std::string{"\xC3\xA9"}});
       expect(decode_all("&#x20AC;") == std::pair{true, std::string{"\xE2\x82\xAC"}});
       expect(decode_all("&#128512;") == std::pair{true, std::string{"\xF0\x9F\x98\x80"}});
@@ -271,6 +270,8 @@ suite entities_and_escaping = [] {
       expect(decode_all("&;").first == false); // empty name
       expect(decode_all("&#;").first == false); // empty number
       expect(decode_all("&#x;").first == false);
+      expect(decode_all("&#").first == false); // truncated right after '#'
+      expect(decode_all("&#x").first == false); // truncated right after 'x'
       expect(decode_all("&#zz;").first == false);
       expect(decode_all("&#1a;").first == false);
       // Code points that are not legal XML characters.
@@ -284,6 +285,13 @@ suite entities_and_escaping = [] {
       // Overflow must not wrap into a valid code point.
       expect(decode_all("&#99999999999999999999;").first == false);
       expect(decode_all("&#xFFFFFFFFFFFFFFFF;").first == false);
+      // XML 1.0 [66] spells the hex marker '&#x' in lowercase only; the
+      // uppercase form is not well-formed. W3C conformance case not-wf-sa-093.
+      expect(decode_all("&#X41;").first == false);
+      expect(decode_all("&#X58;").first == false);
+      // Hex DIGITS remain case-insensitive -- only the marker is not.
+      expect(decode_all("&#xAB;") == std::pair{true, std::string{"\xC2\xAB"}});
+      expect(decode_all("&#xab;") == std::pair{true, std::string{"\xC2\xAB"}});
    };
 
    "encode_utf8"_test = [] {

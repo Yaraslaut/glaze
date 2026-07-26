@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -204,7 +205,11 @@ namespace glz::xml
          if (p >= end) return false;
 
          int base = 10;
-         if (*p == 'x' || *p == 'X') {
+         // Lowercase 'x' ONLY. XML 1.0 [66] CharRef is
+         //   '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';'
+         // so "&#X41;" is not well-formed. W3C case not-wf-sa-093 tests exactly
+         // this. Accepting 'X' here silently admits malformed documents.
+         if (*p == 'x') {
             base = 16;
             ++p;
          }
