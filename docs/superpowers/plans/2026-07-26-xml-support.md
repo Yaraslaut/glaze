@@ -4078,6 +4078,7 @@ namespace
       std::string version{};
       std::string edition{};
       std::string recommendation{};
+      std::string nmspace{};
       fs::path base{}; // directory of the manifest that declared it
    };
 
@@ -4122,6 +4123,7 @@ namespace
          c.version = attr_of(tag, "VERSION");
          c.edition = attr_of(tag, "EDITION");
          c.recommendation = attr_of(tag, "RECOMMENDATION");
+         c.nmspace = attr_of(tag, "NAMESPACE");
          c.base = base;
          if (!c.uri.empty() && !c.type.empty()) {
             cases.push_back(std::move(c));
@@ -4139,8 +4141,20 @@ namespace
       if (c.type == "error") return "TYPE=error is optional behaviour";
       if (c.version == "1.1") return "XML 1.1 is out of scope";
       if (c.recommendation == "XML1.1") return "XML 1.1 is out of scope";
+      // Namespace-inapplicable cases. NAMESPACE="no" marks documents that are
+      // valid XML 1.0 but invalid under XML Namespaces -- e.g. valid-sa-012
+      // uses an attribute named ":". We are namespace-aware, so rejecting them
+      // is correct and they must not be counted as failures.
+      if (c.nmspace == "no") return "NAMESPACE=no: not applicable to a namespace-aware parser";
       // We skip rather than expand the internal DTD subset, so any case whose
       // point is entity expansion cannot be judged here.
+      //
+      // NOTE: the manifest's ENTITIES attribute is NOT sufficient on its own.
+      // ENTITIES="none" means "no EXTERNAL entity processing required" -- such a
+      // document may still declare a general entity in its internal subset and
+      // reference it. Measured against xmltest/valid/sa, 16 of 120 documents are
+      // exactly this shape, and filtering on ENTITIES alone reports them as
+      // false failures. The document-content check below is required as well.
       if (!c.entities.empty() && c.entities != "none") return "requires entity expansion (ENTITIES=" + c.entities + ")";
       // We target XML 1.0 5th edition. EDITION="1 2 3 4" cases assert
       // pre-5th-edition name rules that 5th edition deliberately relaxed.
@@ -4148,6 +4162,18 @@ namespace
          return "applies only to editions " + c.edition;
       }
       return {};
+   }
+
+   // True when the document's internal DTD subset declares a general entity.
+   // Needed because the manifest's ENTITIES attribute only describes EXTERNAL
+   // entity requirements -- see the note in skip_reason.
+   bool declares_internal_entity(std::string_view text)
+   {
+      const auto open = text.find('[');
+      if (open == std::string_view::npos) return false;
+      const auto close = text.find("]>", open);
+      if (close == std::string_view::npos) return false;
+      return text.substr(open, close - open).find("<!ENTITY") != std::string_view::npos;
    }
 
    struct tally
@@ -4188,6 +4214,18 @@ suite w3c_data_driven = [] {
             }
 
             const auto text = read_file(doc);
+
+            // Two content-derived exclusions the manifest cannot express.
+            if (text.size() >= 2 && (static_cast<unsigned char>(text[0]) == 0xFF ||
+                                     static_cast<unsigned char>(text[0]) == 0xFE)) {
+               ++t.skipped; // UTF-16; we are UTF-8 only by design
+               continue;
+            }
+            if (declares_internal_entity(text)) {
+               ++t.skipped; // internal subset declares a general entity; we skip the subset
+               continue;
+            }
+
             glz::generic g{};
             const auto ec =
                glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, text);
