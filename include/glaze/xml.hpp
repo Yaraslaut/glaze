@@ -3,4 +3,5 @@
 
 #pragma once
 
+#include "glaze/xml/common.hpp"
 #include "glaze/xml/opts.hpp"
