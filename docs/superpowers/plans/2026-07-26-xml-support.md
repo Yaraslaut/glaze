@@ -1220,7 +1220,7 @@ git commit -m "feat(xml): add entity/character reference decoding and text escap
     - `bool push_element(std::string_view name) noexcept` — false if depth limit exceeded
     - `bool pop_element(std::string_view name) noexcept` — false if the name does not match the open element
     - `std::string_view current_element() const noexcept`
-    - `size_t depth() const noexcept`
+    - `size_t element_depth() const noexcept`
     - `void push_ns_scope() noexcept` / `void pop_ns_scope() noexcept`
     - `bool bind_prefix(std::string_view prefix, std::string_view uri) noexcept`
     - `std::string_view resolve_prefix(std::string_view prefix) const noexcept` — empty if unbound
@@ -1234,16 +1234,16 @@ Append to `tests/xml_test/xml_test.cpp`:
 suite xml_context_tests = [] {
    "element_stack_nesting"_test = [] {
       glz::xml::xml_context ctx{};
-      expect(ctx.depth() == size_t(0));
+      expect(ctx.element_depth() == size_t(0));
       expect(ctx.push_element("root"));
-      expect(ctx.depth() == size_t(1));
+      expect(ctx.element_depth() == size_t(1));
       expect(ctx.current_element() == "root");
       expect(ctx.push_element("child"));
       expect(ctx.current_element() == "child");
       expect(ctx.pop_element("child"));
       expect(ctx.current_element() == "root");
       expect(ctx.pop_element("root"));
-      expect(ctx.depth() == size_t(0));
+      expect(ctx.element_depth() == size_t(0));
    };
 
    "element_stack_mismatch_rejected"_test = [] {
@@ -1314,6 +1314,21 @@ suite xml_context_tests = [] {
       static_assert(std::same_as<glz::format_context_t<glz::XML>, glz::xml::xml_context>);
       expect(true);
    };
+
+   "xml_context_satisfies_is_context"_test = [] {
+      // Regression guard. glz::context exposes a `uint32_t depth` FIELD, and
+      // glz::is_context requires `{ ctx.depth } -> std::same_as<uint32_t&>`.
+      // Declaring a member FUNCTION named depth() on the derived type hides
+      // that field, silently breaking both this concept and glz::depth_guard,
+      // which every other format reader relies on for recursion protection.
+      static_assert(glz::is_context<glz::xml::xml_context>);
+      glz::xml::xml_context ctx{};
+      {
+         glz::depth_guard guard{ctx};
+         expect(ctx.depth == uint32_t(1));
+      }
+      expect(ctx.depth == uint32_t(0));
+   };
 };
 ```
 
@@ -1350,7 +1365,11 @@ Append inside `namespace glz::xml` in `include/glaze/xml/common.hpp`:
       std::vector<ns_binding> ns_bindings{};
       std::vector<size_t> ns_scope_marks{};
 
-      size_t depth() const noexcept { return element_stack.size(); }
+      // NOT named depth(): glz::context has a `uint32_t depth` FIELD, and a
+      // derived member function of the same name hides it, which breaks both
+      // glz::is_context<xml_context> and the shared glz::depth_guard used by
+      // every other format reader.
+      size_t element_depth() const noexcept { return element_stack.size(); }
 
       std::string_view current_element() const noexcept
       {
@@ -2570,7 +2589,7 @@ suite element_parsing = [] {
       std::string name{};
       expect(glz::xml::parse_end_tag(it, end, ctx, name));
       expect(name == "book");
-      expect(ctx.depth() == size_t(0));
+      expect(ctx.element_depth() == size_t(0));
    };
 
    "mismatched_end_tag_rejected"_test = [] {
