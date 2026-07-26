@@ -1000,6 +1000,79 @@ suite nullable_variant_prettify = [] {
    };
 };
 
+struct var_obj_alt
+{
+   std::string a{};
+};
+
+template <>
+struct glz::meta<var_obj_alt>
+{
+   using T = var_obj_alt;
+   static constexpr auto value = object("a", &T::a);
+};
+
+struct var_obj_holder
+{
+   std::variant<int, var_obj_alt> v{};
+};
+
+template <>
+struct glz::meta<var_obj_holder>
+{
+   using T = var_obj_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+struct var_obj_attr_alt
+{
+   int id{};
+   std::string a{};
+};
+
+template <>
+struct glz::meta<var_obj_attr_alt>
+{
+   using T = var_obj_attr_alt;
+   static constexpr auto value = object("@id", &T::id, "a", &T::a);
+};
+
+struct var_obj_attr_holder
+{
+   std::variant<int, var_obj_attr_alt> v{};
+};
+
+template <>
+struct glz::meta<var_obj_attr_holder>
+{
+   using T = var_obj_attr_holder;
+   static constexpr auto value = object("v", &T::v);
+};
+
+suite variant_of_object = [] {
+   "variant_with_object_alternative_writes_one_close_bracket"_test = [] {
+      // The concept deciding "who closes the start tag" is evaluated on the
+      // variant's static type, which never satisfies it -- so the helper wrote
+      // '>' and the object writer wrote another. The result was well-formed but
+      // <v> round-tripped as mixed content with the text ">".
+      const var_obj_holder h{.v = var_obj_alt{.a = "hi"}};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v><a>hi</a></v></h>") << s;
+   };
+
+   "variant_with_scalar_alternative_still_correct"_test = [] {
+      const var_obj_holder h{.v = 42};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v>42</v></h>") << s;
+   };
+
+   "variant_with_attributed_object_alternative"_test = [] {
+      const var_obj_attr_holder h{.v = var_obj_attr_alt{.id = 1, .a = "hi"}};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "h").value_or("<error>");
+      expect(s == "<h><v id=\"1\"><a>hi</a></v></h>") << s;
+   };
+};
+
 struct xml_chrono_holder
 {
    std::chrono::sys_time<std::chrono::seconds> at{};

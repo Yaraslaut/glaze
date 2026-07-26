@@ -143,26 +143,6 @@ namespace glz
       }
    };
 
-   // std::visit onto the active alternative -- mirrors the TOML writer
-   // (toml/write.hpp:1461-1475). The active alternative is written exactly as if it
-   // had been the member's declared type, so a variant<int, string> member writes
-   // either a numeric or text body under the same element name.
-   template <is_variant T>
-      requires(not custom_write<T>)
-   struct to<XML, T>
-   {
-      template <auto Opts, class... Args>
-      static void op(auto&& value, is_context auto&& ctx, Args&&... args)
-      {
-         std::visit(
-            [&](auto&& alt) {
-               using V = std::decay_t<decltype(alt)>;
-               to<XML, V>::template op<Opts>(alt, ctx, std::forward<Args>(args)...);
-            },
-            value);
-      }
-   };
-
    // std::chrono::system_clock time points and year_month_day: ISO 8601 text
    // content, sharing the digit layout with every other Glaze format via
    // chrono_detail (glaze/core/chrono.hpp). Durations and steady_clock /
@@ -210,14 +190,38 @@ namespace glz
 
 namespace glz::xml::detail
 {
-   // A type whose to<XML, T>::op writes its own '>' after emitting attributes
-   // (i.e. the reflected-object writer below). MUST stay in lockstep with the
-   // `requires` clause on the object to<XML, T> specialization -- if the two
-   // conditions ever diverge, the start tag is either never closed (a type
-   // matches here but the specialization below doesn't run, so nothing ever
-   // writes '>') or closed twice (the reverse).
+   // A reflected object: the type matched by the object to<XML, T>
+   // specialization below. Kept as its own concept (rather than inlining the
+   // clause into xml_writes_own_start_tag_close below) so that specialization's
+   // `requires` clause names exactly the set it applies to and stays
+   // unambiguous with the is_variant specialization -- xml_writes_own_start_tag_close
+   // is a strict superset (it also admits variants), and using it directly as
+   // the object specialization's constraint would make the two partial
+   // specializations equally-constrained, hence ambiguous, for a variant type.
    template <class T>
-   concept xml_writes_own_start_tag_close = (glaze_object_t<T> || reflectable<T>) && !custom_write<T>;
+   concept xml_reflected_object = (glaze_object_t<T> || reflectable<T>) && !custom_write<T>;
+
+   // A type whose to<XML, T>::op writes its own '>' after emitting attributes.
+   // MUST stay in lockstep with xml_reflected_object -- if the two ever
+   // diverge, the start tag is either never closed (a type matches here but
+   // the object specialization below doesn't run, so nothing ever writes '>')
+   // or closed twice (the reverse).
+   //
+   // Variants are included too, but for a different reason: which shape a
+   // variant needs (own-close vs. helper-closes) depends on the *active
+   // alternative*, which is only known at runtime -- no compile-time branch
+   // on the variant's static type can get this right. So a variant always
+   // takes responsibility for its own start tag close, and to<XML, is_variant
+   // T>::op (below) re-applies this same concept, per alternative, inside the
+   // std::visit to decide whether to delegate (object alternative closes
+   // itself) or close '>' itself first (scalar/string/enum/container/nested-
+   // variant alternative). Without this, write_wrapped_element would always
+   // write '>' for a variant (its static type never satisfies the object
+   // clause), and an object alternative would then write a second '>' of its
+   // own -- well-formed but silently wrong output (a stray '>' character
+   // lands in the element body).
+   template <class T>
+   concept xml_writes_own_start_tag_close = xml_reflected_object<T> || (is_variant<T> && !custom_write<T>);
 
    // True when T is a reflected object with a member keyed "#text" (mixed
    // content: text interleaved with child elements). Decided entirely at
@@ -344,6 +348,52 @@ namespace glz::xml::detail
 
 namespace glz
 {
+   // std::visit onto the active alternative -- mirrors the TOML writer
+   // (toml/write.hpp:1461-1475). The active alternative is written exactly as if it
+   // had been the member's declared type, so a variant<int, string> member writes
+   // either a numeric or text body under the same element name.
+   //
+   // A variant satisfies xml_writes_own_start_tag_close (see the concept's
+   // comment in xml::detail), so write_wrapped_element never writes '>' for a
+   // variant -- this op is entirely responsible for it. Which shape is
+   // correct depends on the *active* alternative, decided per-visit with the
+   // same concept applied to the alternative's own type:
+   //  - if the alternative itself owns its start-tag close (a reflected
+   //    object, or -- recursively -- a nested variant), delegate to it
+   //    unchanged: it emits its attribute pass and then its own '>'.
+   //  - otherwise (scalars, strings, enums, chrono types, containers, ...)
+   //    this op writes '>' first, exactly as write_wrapped_element's
+   //    non-owning branch would have, then lets the alternative write only
+   //    body text.
+   // Either way, exactly one '>' is written, matching the invariant
+   // write_wrapped_element documents for every other type.
+   template <is_variant T>
+      requires(not custom_write<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         std::visit(
+            [&](auto&& alt) {
+               using V = std::decay_t<decltype(alt)>;
+               if constexpr (xml::detail::xml_writes_own_start_tag_close<V>) {
+                  to<XML, V>::template op<Opts>(alt, ctx, b, ix);
+               }
+               else {
+                  // Same guard as write_wrapped_element and the object
+                  // writer's attribute pass: don't close a start tag whose
+                  // preceding write already failed.
+                  if (not bool(ctx.error)) [[likely]] {
+                     xml::detail::append_raw(">", ctx, b, ix);
+                  }
+                  to<XML, V>::template op<Opts>(alt, ctx, b, ix);
+               }
+            },
+            value);
+      }
+   };
+
    // Reflected object writer: partitions members by key sigil into attributes
    // ("@name"), text content ("#text"), and child elements (everything else).
    // Attributes must appear inside the start tag, so the member loop runs
@@ -352,7 +402,7 @@ namespace glz
    // wrapper itself; xml::detail::write_wrapped_element owns that, so it can
    // be reused unchanged for both the document root and nested elements.
    template <class T>
-      requires(xml::detail::xml_writes_own_start_tag_close<T>)
+      requires(xml::detail::xml_reflected_object<T>)
    struct to<XML, T>
    {
       template <auto Opts, class V, class B>
