@@ -5,19 +5,19 @@
 
 #include "glaze/core/context.hpp"
 #include "glaze/core/opts.hpp"
-#include "glaze/xml/read.hpp"
+#include "glaze/xml/common.hpp"
 
-// This file depends on xml/read.hpp for the scanning primitives
-// (parse_start_tag, parse_comment, parse_pi, parse_char_data, parse_end_tag)
-// and for xml::skip_element, which already implements the algorithm described
-// below (start tag, then a loop over char data / comments / PIs / nested
-// elements -- recursing for nested elements -- until the matching end tag,
-// with recursion depth bounded by parse_start_tag's own ctx.push_element
-// call). read.hpp's object reader needs the same "skip one unknown child"
-// capability for its error_on_unknown_keys=false path, so read.hpp cannot
-// also include this file (that would be circular); it calls xml::skip_element
-// directly instead. glz::skip_value<XML> below is therefore a thin forwarder
-// onto that shared implementation, not a second copy of it.
+// xml::skip_element (xml/common.hpp) already implements the algorithm
+// described below: a start tag, then a loop over char data / comments / PIs
+// / nested elements -- recursing for nested elements -- until the matching
+// end tag, with recursion depth bounded by parse_start_tag's own
+// ctx.push_element call. glz::skip_value<XML> below is a thin forwarder onto
+// that shared implementation, matching every sibling format (json/skip.hpp,
+// yaml/skip.hpp, toml/skip.hpp), each of which depends only on its own
+// common.hpp -- not on read.hpp -- so that skip.hpp stays a lightweight,
+// standalone header. xml/read.hpp's object reader includes this file and
+// calls skip_value<XML>::op for its own "skip one unknown child" need
+// (error_on_unknown_keys off).
 
 namespace glz
 {
