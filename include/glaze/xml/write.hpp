@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <cmath>
+#include <concepts>
+
 #include "glaze/core/buffer_traits.hpp"
 #include "glaze/core/chrono.hpp"
 #include "glaze/core/opts.hpp"
@@ -12,7 +15,6 @@
 #include "glaze/core/write.hpp"
 #include "glaze/core/write_chars.hpp"
 #include "glaze/core/write_wrappers.hpp"
-#include "glaze/json/write.hpp"
 #include "glaze/util/dump.hpp"
 #include "glaze/util/for_each.hpp"
 #include "glaze/util/itoa.hpp"
@@ -48,8 +50,26 @@ namespace glz
       template <auto Opts, class B>
       static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
       {
-         // Reuse Glaze's shared number formatting so XML matches JSON exactly.
-         to<JSON, std::remove_cvref_t<decltype(value)>>::template op<set_json<Opts>()>(value, ctx, b, ix);
+         if (!ensure_space(ctx, b, ix + 32 + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         // XSD 1.0 lexical space for xs:float / xs:double spells the special
+         // values "NaN", "INF" and "-INF". Do NOT delegate to to<JSON, T> here:
+         // JSON has no NaN/Inf, so it emits "null" -- which in XML is just the
+         // literal text "null", collapses three distinct values into one, and
+         // makes a document fail the xs:double schema generated in Phase 5.
+         // Use the shared write_chars, as every sibling format does.
+         if constexpr (std::floating_point<std::remove_cvref_t<T>>) {
+            if (std::isnan(value)) {
+               dump("NaN", b, ix);
+               return;
+            }
+            if (std::isinf(value)) {
+               dump(value < 0 ? "-INF" : "INF", b, ix);
+               return;
+            }
+         }
+         write_chars::op<Opts>(value, ctx, b, ix);
       }
    };
 

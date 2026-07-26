@@ -3,8 +3,10 @@
 
 #include "glaze/xml.hpp"
 
+#include <cmath>
 #include <concepts>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -498,6 +500,17 @@ suite scalar_writing = [] {
       expect(write_scalar(1.5) == "<root>1.5</root>");
       expect(write_scalar(0.0) == "<root>0</root>");
       expect(write_scalar(-2.25) == "<root>-2.25</root>");
+   };
+
+   "write_special_floats_use_xsd_lexical_space"_test = [] {
+      // XSD 1.0 spells these "NaN", "INF", "-INF" for xs:float / xs:double.
+      // Emitting JSON's "null" here would collapse three distinct values and
+      // produce documents that fail the xs:double schema generated in Phase 5.
+      expect(write_scalar(std::numeric_limits<double>::quiet_NaN()) == "<root>NaN</root>");
+      expect(write_scalar(std::numeric_limits<double>::infinity()) == "<root>INF</root>");
+      expect(write_scalar(-std::numeric_limits<double>::infinity()) == "<root>-INF</root>");
+      expect(write_scalar(std::numeric_limits<float>::quiet_NaN()) == "<root>NaN</root>");
+      expect(write_scalar(-std::numeric_limits<float>::infinity()) == "<root>-INF</root>");
    };
 
    "write_strings_are_escaped"_test = [] {
