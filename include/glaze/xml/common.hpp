@@ -380,7 +380,11 @@ namespace glz::xml
       std::vector<ns_binding> ns_bindings{};
       std::vector<size_t> ns_scope_marks{};
 
-      size_t depth() const noexcept { return element_stack.size(); }
+      // NOT named depth(): glz::context has a `uint32_t depth` FIELD, and a
+      // derived member function of the same name hides it, which breaks both
+      // glz::is_context<xml_context> and the shared glz::depth_guard used by
+      // every other format reader.
+      size_t element_depth() const noexcept { return element_stack.size(); }
 
       std::string_view current_element() const noexcept
       {

@@ -366,16 +366,16 @@ suite entities_and_escaping = [] {
 suite xml_context_tests = [] {
    "element_stack_nesting"_test = [] {
       glz::xml::xml_context ctx{};
-      expect(ctx.depth() == size_t(0));
+      expect(ctx.element_depth() == size_t(0));
       expect(ctx.push_element("root"));
-      expect(ctx.depth() == size_t(1));
+      expect(ctx.element_depth() == size_t(1));
       expect(ctx.current_element() == "root");
       expect(ctx.push_element("child"));
       expect(ctx.current_element() == "child");
       expect(ctx.pop_element("child"));
       expect(ctx.current_element() == "root");
       expect(ctx.pop_element("root"));
-      expect(ctx.depth() == size_t(0));
+      expect(ctx.element_depth() == size_t(0));
    };
 
    "element_stack_mismatch_rejected"_test = [] {
@@ -445,6 +445,21 @@ suite xml_context_tests = [] {
    "format_context_specialized"_test = [] {
       static_assert(std::same_as<glz::format_context_t<glz::XML>, glz::xml::xml_context>);
       expect(true);
+   };
+
+   "xml_context_satisfies_is_context"_test = [] {
+      // Regression guard. glz::context exposes a `uint32_t depth` FIELD, and
+      // glz::is_context requires `{ ctx.depth } -> std::same_as<uint32_t&>`.
+      // Declaring a member FUNCTION named depth() on the derived type hides
+      // that field, silently breaking both this concept and glz::depth_guard,
+      // which every other format reader relies on for recursion protection.
+      static_assert(glz::is_context<glz::xml::xml_context>);
+      glz::xml::xml_context ctx{};
+      {
+         glz::depth_guard guard{ctx};
+         expect(ctx.depth == uint32_t(1));
+      }
+      expect(ctx.depth == uint32_t(0));
    };
 };
 
