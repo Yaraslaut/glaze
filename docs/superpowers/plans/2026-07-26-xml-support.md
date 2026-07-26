@@ -2424,7 +2424,7 @@ suite document_scanner = [] {
       expect(pi("<?target data here?>").first);
       expect(pi("<?target  multi ? word?>").first);
       expect(!pi("<?target").first);          // unterminated
-      expect(!pi("<??>").first);              // empty target
+      expect(!pi("<?\?>").first);             // empty target (\? avoids a trigraph warning)
       expect(!pi("<?1bad?>").first);          // target is not a Name
       // 'xml' in any case is reserved and may not be used as a PI target.
       expect(!pi("<?xml version=\"1.0\"?>").first);
