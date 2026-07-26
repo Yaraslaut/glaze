@@ -1898,6 +1898,16 @@ suite object_writing = [] {
       expect(r.error() == glz::error_code::syntax_error);
    };
 
+   "attribute_names_are_validated_too"_test = [] {
+      // Attribute and element names share the XML Name production. This is a
+      // compile-time property, so the guard is a static_assert in the writer;
+      // this case documents the contract and pins the positive half of it.
+      static_assert(glz::xml::validate_name(glz::xml::strip_sigil("@id")));
+      static_assert(!glz::xml::validate_name(glz::xml::strip_sigil("@1bad")));
+      static_assert(glz::xml::validate_name(glz::xml::strip_sigil("@xml:lang")));
+      expect(true);
+   };
+
    "sigil_helpers"_test = [] {
       static_assert(glz::xml::is_attribute_key("@id"));
       static_assert(!glz::xml::is_attribute_key("id"));
@@ -1960,8 +1970,16 @@ on `(glaze_object_t<T> || reflectable<T>) && !custom_write<T>`. Its `op` must:
 4. **Element pass.** For every remaining member, emit `<key>`, recurse via
    `serialize<XML>::op<Opts>`, then `</key>`.
 5. **Name validation.** When `check_validate_names(Opts)`, `static_assert`
-   that each non-sigil key satisfies `xml::validate_name` — keys are
-   compile-time constants, so this is a compile-time check, not a runtime one.
+   that **every** key names something legal, not just element keys. Keys are
+   compile-time constants, so this is a compile-time check, not a runtime one:
+   - element keys must satisfy `xml::validate_name(key)`
+   - attribute keys must satisfy `xml::validate_name(xml::strip_sigil(key))` —
+     attribute and element names share the XML `Name` production, so validating
+     one and not the other is indefensible. Skipping it lets
+     `object("@1bad", &T::x)` emit `<r 1bad="5">`, which xmllint rejects with
+     "error parsing attribute name". Glaze must never emit a document it would
+     itself reject.
+   - `#text` is exempt: it names content, not an element or attribute.
 
 Because attributes belong in the start tag, `write_xml` must no longer emit the
 root tags itself for object types. Restructure so the object writer owns its own
