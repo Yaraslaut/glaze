@@ -5,4 +5,5 @@
 
 #include "glaze/xml/common.hpp"
 #include "glaze/xml/opts.hpp"
+#include "glaze/xml/read.hpp"
 #include "glaze/xml/write.hpp"

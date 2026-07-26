@@ -1197,4 +1197,102 @@ suite chrono_types = [] {
    };
 };
 
+namespace
+{
+   // Runs a scanner function over a whole buffer and reports success plus how
+   // many bytes it consumed.
+   template <class Fn>
+   std::pair<bool, size_t> scan(Fn&& fn, std::string_view s)
+   {
+      glz::xml::xml_context ctx{};
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      const bool ok = fn(it, end, ctx);
+      return {ok && !bool(ctx.error), size_t(it - s.data())};
+   }
+}
+
+suite document_scanner = [] {
+   auto comment = [](std::string_view s) {
+      return scan([](auto& it, auto e, auto& c) { return glz::xml::parse_comment(it, e, c); }, s);
+   };
+   auto pi = [](std::string_view s) {
+      return scan([](auto& it, auto e, auto& c) { return glz::xml::parse_pi(it, e, c); }, s);
+   };
+   auto decl = [](std::string_view s) {
+      return scan([](auto& it, auto e, auto& c) { return glz::xml::parse_xml_declaration(it, e, c); }, s);
+   };
+
+   "comments"_test = [comment] {
+      expect(comment("<!-- hello -->") == std::pair{true, size_t(14)});
+      expect(comment("<!---->").first);
+      expect(comment("<!--a-->").first);
+      // '--' may not appear inside a comment, and it may not end in '--->'.
+      expect(!comment("<!-- a -- b -->").first);
+      expect(!comment("<!-- a --->").first);
+      expect(!comment("<!-- unterminated").first);
+      expect(!comment("<!-").first);
+   };
+
+   "processing_instructions"_test = [pi] {
+      expect(pi("<?target?>").first);
+      expect(pi("<?target data here?>").first);
+      expect(pi("<?target  multi ? word?>").first);
+      expect(!pi("<?target").first); // unterminated
+      expect(!pi("<?\?>").first); // empty target
+      expect(!pi("<?1bad?>").first); // target is not a Name
+      // 'xml' in any case is reserved and may not be used as a PI target.
+      expect(!pi("<?xml version=\"1.0\"?>").first);
+      expect(!pi("<?XML foo?>").first);
+      expect(!pi("<?xMl foo?>").first);
+      // A target merely starting with 'xml' is fine.
+      expect(pi("<?xmlfoo bar?>").first);
+   };
+
+   "xml_declaration"_test = [decl] {
+      expect(decl("<?xml version=\"1.0\"?>").first);
+      expect(decl("<?xml version='1.0'?>").first);
+      expect(decl("<?xml version=\"1.0\" encoding=\"UTF-8\"?>").first);
+      expect(decl("<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\"?>").first);
+      expect(decl("<?xml version=\"1.0\" standalone=\"no\"?>").first);
+      expect(decl("<?xml version=\"1.1\"?>").first);
+      // Malformed declarations.
+      expect(!decl("<?xml?>").first); // version is mandatory
+      expect(!decl("<?xml encoding=\"UTF-8\"?>").first); // version must come first
+      expect(!decl("<?xml version=\"1.0\" standalone=\"maybe\"?>").first);
+      expect(!decl("<?xml version=\"2.0\"?>").first); // unsupported version
+      expect(!decl("<?xml version=\"1.0\" encoding=\"9bad\"?>").first); // EncName must start alnum
+      expect(!decl("<?xml version = \"1.0\" foo=\"bar\"?>").first); // unknown pseudo-attribute
+      expect(!decl("<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?>").first); // wrong order
+   };
+
+   "bom_is_skipped"_test = [] {
+      std::string_view s = "\xEF\xBB\xBF<a/>";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      expect(glz::xml::skip_bom(it, end));
+      expect(size_t(it - s.data()) == size_t(3));
+   };
+
+   "utf8_validation"_test = [] {
+      size_t bad = 0;
+      expect(glz::xml::validate_utf8("plain ascii", bad));
+      expect(glz::xml::validate_utf8("caf\xC3\xA9", bad));
+      expect(!glz::xml::validate_utf8("bad \xFF byte", bad));
+      expect(bad == size_t(4));
+      expect(!glz::xml::validate_utf8("\xC3", bad)); // truncated
+      expect(!glz::xml::validate_utf8("\xED\xA0\x80", bad)); // encoded surrogate
+   };
+
+   "prolog_accepts_misc_before_root"_test = [] {
+      auto prolog = [](std::string_view s) {
+         return scan([](auto& it, auto e, auto& c) { return glz::xml::parse_prolog(it, e, c); }, s);
+      };
+      expect(prolog("<?xml version=\"1.0\"?><a/>").second == size_t(21));
+      expect(prolog("<!-- c --><a/>").second == size_t(10));
+      expect(prolog("<?xml version=\"1.0\"?>\n<!-- c -->\n<?pi?>\n<a/>").first);
+      expect(prolog("<a/>").second == size_t(0)); // prolog may be empty
+   };
+};
+
 int main() {}
