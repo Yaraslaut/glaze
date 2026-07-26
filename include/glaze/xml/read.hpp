@@ -4,13 +4,28 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "glaze/core/context.hpp"
 #include "glaze/xml/common.hpp"
 
 namespace glz::xml
 {
+   struct attribute
+   {
+      std::string name;
+      std::string value;
+   };
+
+   struct start_tag
+   {
+      std::string name;
+      std::vector<attribute> attributes;
+      bool self_closing{};
+   };
+
    // Advances past any run of XML whitespace (S ::= (#x20 | #x9 | #xD | #xA)+).
    inline void skip_whitespace(const char*& it, const char* end) noexcept
    {
@@ -286,6 +301,200 @@ namespace glz::xml
          }
          break; // the document element (or, later, a doctypedecl) starts here
       }
+      return true;
+   }
+
+   namespace detail
+   {
+      // Reads a maximal run of NameChar starting at 'p'. Does not itself verify
+      // that the result is a well-formed Name (i.e. that the first character is
+      // a NameStartChar) -- callers pass the result through validate_name.
+      inline std::string_view read_name_span(const char*& p, const char* end) noexcept
+      {
+         const char* const begin = p;
+         while (p < end) {
+            char32_t cp{};
+            const size_t n = decode_utf8(p, end, cp);
+            if (n == 0 || !is_name_char(cp)) break;
+            p += n;
+         }
+         return std::string_view{begin, size_t(p - begin)};
+      }
+   }
+
+   // AttValue ::= '"' ([^<&"] | Reference)* '"' | "'" ([^<&'] | Reference)* "'"
+   // XML 1.0 3.3.3 attribute-value normalization: a literal tab, LF, or CR is
+   // replaced by a single space (a literal CRLF collapses to one space, not
+   // two); a character reference to one of those same characters is NOT
+   // normalized -- it is inserted verbatim by decode_reference below.
+   inline bool parse_attribute_value(const char*& it, const char* end, xml_context& ctx, std::string& out) noexcept
+   {
+      if (it >= end || (*it != '"' && *it != '\'')) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      const char quote = *it;
+      const char* p = it + 1;
+      out.clear();
+
+      while (true) {
+         if (p >= end) {
+            ctx.error = error_code::unexpected_end;
+            return false;
+         }
+         const char c = *p;
+         if (c == quote) {
+            ++p;
+            it = p;
+            return true;
+         }
+         if (c == '<') {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         if (c == '&') {
+            if (!decode_reference(p, end, out)) {
+               ctx.error = error_code::syntax_error;
+               return false;
+            }
+            continue;
+         }
+         if (c == '\r') {
+            ++p;
+            if (p < end && *p == '\n') {
+               ++p;
+            }
+            out.push_back(' ');
+            continue;
+         }
+         if (c == '\n' || c == '\t') {
+            out.push_back(' ');
+            ++p;
+            continue;
+         }
+         out.push_back(c);
+         ++p;
+      }
+   }
+
+   // STag ::= '<' Name (S Attribute)* S? '>' | EmptyElemTag ::= '<' Name (S Attribute)* S? '/>'
+   // Attribute ::= Name Eq AttValue
+   //
+   // Each Attribute must be preceded by whitespace separating it from the
+   // element name or the previous attribute -- '<book id="7"role="x">' is not
+   // well-formed even though both attributes are individually valid.
+   inline bool parse_start_tag(const char*& it, const char* end, xml_context& ctx, start_tag& out) noexcept
+   {
+      if (it >= end || *it != '<') {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      const char* p = it + 1;
+      const std::string_view name = detail::read_name_span(p, end);
+      if (!validate_name(name)) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+
+      out.name = name;
+      out.attributes.clear();
+      out.self_closing = false;
+
+      while (true) {
+         const char* const before_ws = p;
+         skip_whitespace(p, end);
+         const bool had_whitespace = p != before_ws;
+
+         if (p >= end) {
+            ctx.error = error_code::unexpected_end;
+            return false;
+         }
+         if (*p == '>') {
+            ++p;
+            break;
+         }
+         if (*p == '/') {
+            ++p;
+            if (p >= end || *p != '>') {
+               ctx.error = error_code::syntax_error;
+               return false;
+            }
+            ++p;
+            out.self_closing = true;
+            break;
+         }
+
+         if (!had_whitespace) {
+            ctx.error = error_code::syntax_error; // no S separating this attribute from the previous token
+            return false;
+         }
+
+         const std::string_view attr_name = detail::read_name_span(p, end);
+         if (!validate_name(attr_name)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         for (const auto& existing : out.attributes) {
+            if (existing.name == attr_name) {
+               ctx.error = error_code::duplicate_key;
+               return false;
+            }
+         }
+
+         skip_whitespace(p, end);
+         if (p >= end || *p != '=') {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         ++p;
+         skip_whitespace(p, end);
+
+         std::string value;
+         if (!parse_attribute_value(p, end, ctx, value)) {
+            return false;
+         }
+
+         out.attributes.emplace_back(attribute{std::string{attr_name}, std::move(value)});
+      }
+
+      it = p;
+      if (!out.self_closing) {
+         if (!ctx.push_element(out.name)) {
+            return false;
+         }
+      }
+      return true;
+   }
+
+   // ETag ::= '</' Name S? '>'
+   // Neither attributes nor a trailing '/' are permitted here; both fall out
+   // naturally because anything other than whitespace before '>' is rejected.
+   inline bool parse_end_tag(const char*& it, const char* end, xml_context& ctx, std::string& name) noexcept
+   {
+      if (size_t(end - it) < 2 || it[0] != '<' || it[1] != '/') {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      const char* p = it + 2;
+      const std::string_view name_view = detail::read_name_span(p, end);
+      if (!validate_name(name_view)) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+
+      skip_whitespace(p, end);
+      if (p >= end || *p != '>') {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+      ++p;
+
+      if (!ctx.pop_element(name_view)) {
+         return false;
+      }
+
+      name = name_view;
+      it = p;
       return true;
    }
 }

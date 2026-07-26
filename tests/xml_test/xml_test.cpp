@@ -1318,4 +1318,134 @@ suite document_scanner = [] {
    };
 };
 
+namespace
+{
+   struct tag_result
+   {
+      bool ok{};
+      std::string name{};
+      std::vector<std::pair<std::string, std::string>> attrs{};
+      bool self_closing{};
+   };
+
+   tag_result read_start_tag(std::string_view s)
+   {
+      glz::xml::xml_context ctx{};
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      glz::xml::start_tag t{};
+      tag_result r{};
+      r.ok = glz::xml::parse_start_tag(it, end, ctx, t) && !bool(ctx.error);
+      r.name = t.name;
+      r.self_closing = t.self_closing;
+      for (const auto& a : t.attributes) {
+         r.attrs.emplace_back(a.name, a.value);
+      }
+      return r;
+   }
+}
+
+suite element_parsing = [] {
+   "simple_start_tag"_test = [] {
+      const auto r = read_start_tag("<book>");
+      expect(r.ok);
+      expect(r.name == "book");
+      expect(r.attrs.empty());
+      expect(!r.self_closing);
+   };
+
+   "self_closing_tag"_test = [] {
+      const auto r = read_start_tag("<book/>");
+      expect(r.ok);
+      expect(r.name == "book");
+      expect(r.self_closing);
+   };
+
+   "attributes_parsed"_test = [] {
+      const auto r = read_start_tag("<u id=\"7\" role='admin'>");
+      expect(r.ok);
+      expect(r.attrs.size() == size_t(2));
+      expect(r.attrs[0] == std::pair{std::string{"id"}, std::string{"7"}});
+      expect(r.attrs[1] == std::pair{std::string{"role"}, std::string{"admin"}});
+   };
+
+   "attribute_whitespace_tolerance"_test = [] {
+      const auto r = read_start_tag("<u\n  id = \"7\"\t/>");
+      expect(r.ok);
+      expect(r.attrs.size() == size_t(1));
+      expect(r.attrs[0].second == "7");
+   };
+
+   "attribute_entities_expanded"_test = [] {
+      const auto r = read_start_tag("<u v=\"a&amp;b&lt;c&#65;\">");
+      expect(r.ok);
+      expect(r.attrs[0].second == "a&b<cA");
+   };
+
+   "attribute_value_normalization"_test = [] {
+      // XML 1.0 3.3.3: literal tab/newline/CR in an attribute value normalize
+      // to a single space each; character references do NOT.
+      expect(read_start_tag("<u v=\"a\tb\">").attrs[0].second == "a b");
+      expect(read_start_tag("<u v=\"a\nb\">").attrs[0].second == "a b");
+      expect(read_start_tag("<u v=\"a\r\nb\">").attrs[0].second == "a b");
+      expect(read_start_tag("<u v=\"a&#x9;b\">").attrs[0].second == "a\tb");
+   };
+
+   "malformed_start_tags_rejected"_test = [] {
+      expect(!read_start_tag("<>").ok); // empty name
+      expect(!read_start_tag("<1bad>").ok); // name must start with NameStartChar
+      expect(!read_start_tag("<book").ok); // unterminated
+      expect(!read_start_tag("<book id>").ok); // attribute needs a value
+      expect(!read_start_tag("<book id=>").ok); // missing value
+      expect(!read_start_tag("<book id=7>").ok); // value must be quoted
+      expect(!read_start_tag("<book id=\"7'>").ok); // mismatched quotes
+      expect(!read_start_tag("<book id=\"a<b\">").ok); // '<' is forbidden in a value
+      expect(!read_start_tag("<book id=\"7\"role=\"x\">").ok); // needs whitespace between attrs
+   };
+
+   "duplicate_attributes_rejected"_test = [] {
+      glz::xml::xml_context ctx{};
+      std::string_view s = "<u id=\"1\" id=\"2\">";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      glz::xml::start_tag t{};
+      const bool ok = glz::xml::parse_start_tag(it, end, ctx, t);
+      expect(!ok);
+      expect(ctx.error == glz::error_code::duplicate_key);
+   };
+
+   "end_tag_matching"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(ctx.push_element("book"));
+      std::string_view s = "</book>";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      std::string name{};
+      expect(glz::xml::parse_end_tag(it, end, ctx, name));
+      expect(name == "book");
+      expect(ctx.element_depth() == size_t(0));
+   };
+
+   "mismatched_end_tag_rejected"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(ctx.push_element("a"));
+      std::string_view s = "</b>";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      std::string name{};
+      expect(!glz::xml::parse_end_tag(it, end, ctx, name));
+      expect(ctx.error == glz::error_code::syntax_error);
+   };
+
+   "end_tag_forbids_attributes_and_slash"_test = [] {
+      glz::xml::xml_context ctx{};
+      expect(ctx.push_element("a"));
+      std::string_view s = "</a id=\"1\">";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      std::string name{};
+      expect(!glz::xml::parse_end_tag(it, end, ctx, name));
+   };
+};
+
 int main() {}
