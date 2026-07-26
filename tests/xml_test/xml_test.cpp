@@ -906,6 +906,31 @@ struct glz::meta<xml_variant_holder>
    static constexpr auto value = object("v", &T::v);
 };
 
+struct attr_only_point
+{
+   int x{};
+   int y{};
+};
+
+template <>
+struct glz::meta<attr_only_point>
+{
+   using T = attr_only_point;
+   static constexpr auto value = object("@x", &T::x, "@y", &T::y);
+};
+
+struct opt_attr_holder
+{
+   std::optional<attr_only_point> p{};
+};
+
+template <>
+struct glz::meta<opt_attr_holder>
+{
+   using T = opt_attr_holder;
+   static constexpr auto value = object("p", &T::p);
+};
+
 struct xml_mixed
 {
    std::string text{};
@@ -1821,6 +1846,66 @@ suite container_and_generic_reading = [] {
       expect(!glz::read_xml(g, xml));
       const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(g, "book").value_or("<error>");
       expect(out == xml) << out;
+   };
+};
+
+suite nullable_attribute_only = [] {
+   "optional_of_attribute_only_struct_round_trips"_test = [] {
+      // An element carrying only attributes is NOT empty. Treating it as empty
+      // disengaged the optional and silently dropped x and y, with no error --
+      // reachable through this library's own write -> read round trip.
+      const opt_attr_holder h{.p = attr_only_point{.x = 1, .y = 2}};
+      const auto xml = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(h, "root").value_or("<error>");
+      expect(xml == R"(<root><p x="1" y="2"></p></root>)") << xml;
+
+      opt_attr_holder back{};
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.write_declaration = false}>(back, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(back.p.has_value()) << "attributes must keep the optional engaged";
+      if (back.p.has_value()) {
+         expect(back.p->x == 1);
+         expect(back.p->y == 2);
+      }
+   };
+
+   "self_closing_with_attributes_stays_engaged"_test = [] {
+      opt_attr_holder back{};
+      const std::string xml = R"(<root><p x="3" y="4"/></root>)";
+      const auto ec = glz::read_xml(back, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(back.p.has_value());
+      if (back.p.has_value()) {
+         expect(back.p->x == 3);
+         expect(back.p->y == 4);
+      }
+   };
+
+   "genuinely_empty_element_still_disengages"_test = [] {
+      // Regression guard for the pre-existing behavior the fix must preserve.
+      xml_opt_holder h{};
+      expect(!glz::read_xml(h, std::string{"<h><maybe/><always>x</always></h>"}));
+      expect(!h.maybe.has_value());
+
+      xml_opt_holder h2{};
+      expect(!glz::read_xml(h2, std::string{"<h><maybe></maybe><always>x</always></h>"}));
+      expect(!h2.maybe.has_value());
+   };
+};
+
+suite generic_whitespace_collapse = [] {
+   "whitespace_only_collapses_to_empty"_test = [] {
+      // The rule is "non-whitespace text becomes #text". The collapse branch
+      // bypassed it, so <description>\n</description> became the string "\n".
+      auto read = [](std::string_view d) {
+         glz::generic g{};
+         (void)glz::read_xml(g, std::string{d});
+         return g.holds<std::string>() ? g.get<std::string>() : std::string{"<not-a-string>"};
+      };
+      expect(read("<empty></empty>") == "");
+      expect(read("<empty/>") == "");
+      expect(read("<empty>\n</empty>") == "") << "pretty-printed empty leaf must not become a noise string";
+      expect(read("<e>  \t </e>") == "");
+      expect(read("<e>text</e>") == "text");
    };
 };
 

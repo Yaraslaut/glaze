@@ -56,13 +56,16 @@ namespace glz::xml
    }
 
    // Peeks whether the upcoming element (`it` must be at '<') is "empty" for
-   // nullable_like purposes: either self-closing ("<name .../>") or
-   // non-self-closing with zero characters of content ("<name></name>").
-   // Like peek_element_name above, this is a pure classifier -- it never
-   // touches `it` or ctx, so from<XML, nullable_like T> can decide which
-   // branch to take before committing to a real, error-reporting parse. A
-   // malformed or truncated tag simply reports false (not empty); the real
-   // parse that follows in either branch is what actually rejects it.
+   // nullable_like purposes: it must carry no attributes, and be either
+   // self-closing ("<name/>") or non-self-closing with zero characters of
+   // content ("<name></name>"). An element with attributes is never empty,
+   // even if self-closing or content-free -- the attributes are data that a
+   // disengaged nullable would silently drop. Like peek_element_name above,
+   // this is a pure classifier -- it never touches `it` or ctx, so
+   // from<XML, nullable_like T> can decide which branch to take before
+   // committing to a real, error-reporting parse. A malformed or truncated
+   // tag simply reports false (not empty); the real parse that follows in
+   // either branch is what actually rejects it.
    inline bool peek_is_empty_element(const char* it, const char* end) noexcept
    {
       if (it >= end || *it != '<') {
@@ -73,6 +76,8 @@ namespace glz::xml
       if (name.empty()) {
          return false;
       }
+
+      bool has_attributes = false;
 
       while (true) {
          const char* const before_ws = p;
@@ -88,7 +93,7 @@ namespace glz::xml
          }
          if (*p == '/') {
             ++p;
-            return p < end && *p == '>'; // self-closing => empty
+            return !has_attributes && p < end && *p == '>'; // self-closing, no attrs => empty
          }
          if (!had_ws) {
             return false; // malformed; let the real parse report it
@@ -98,6 +103,7 @@ namespace glz::xml
          if (attr_name.empty()) {
             return false;
          }
+         has_attributes = true;
          skip_whitespace(p, end);
          if (p >= end || *p != '=') {
             return false;
@@ -119,6 +125,10 @@ namespace glz::xml
             return false;
          }
          ++p; // past the closing quote
+      }
+
+      if (has_attributes) {
+         return false;
       }
 
       // p is right after the '>' of a non-self-closing start tag.
@@ -571,10 +581,12 @@ namespace glz
    };
 
    // nullable_like (std::optional, std::unique_ptr, std::shared_ptr, raw
-   // pointers, ...): a self-closing element ("<maybe/>"), or a non-
-   // self-closing one with no content at all ("<maybe></maybe>"), leaves the
-   // value disengaged; anything else constructs the held value and recurses.
-   // xml::peek_is_empty_element is a non-mutating look-ahead (mirroring
+   // pointers, ...): a self-closing element with no attributes ("<maybe/>"),
+   // or a non-self-closing one with no attributes and no content at all
+   // ("<maybe></maybe>"), leaves the value disengaged; anything else --
+   // including an element that carries only attributes ("<maybe x="1"/>")
+   // -- constructs the held value and recurses. xml::peek_is_empty_element
+   // is a non-mutating look-ahead (mirroring
    // xml::peek_element_name) precisely because parse_start_tag pushes the
    // element name onto ctx.element_stack as a side effect -- calling it
    // speculatively and then again for real would push twice.
@@ -782,7 +794,11 @@ namespace glz
          }
 
          if (!any_attr && !any_child) {
-            value.data = std::move(text);
+            // Same whitespace-only rule as the #text branch below: a
+            // pretty-printed empty leaf ("<description>\n</description>")
+            // must collapse to "", not carry the indentation whitespace as
+            // if it were meaningful text content.
+            value.data = xml::is_whitespace_only(text) ? std::string{} : std::move(text);
             return;
          }
          if (!xml::is_whitespace_only(text)) {
