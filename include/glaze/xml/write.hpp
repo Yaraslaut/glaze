@@ -124,6 +124,15 @@ namespace glz
 
 namespace glz::xml::detail
 {
+   // A type whose to<XML, T>::op writes its own '>' after emitting attributes
+   // (i.e. the reflected-object writer below). MUST stay in lockstep with the
+   // `requires` clause on the object to<XML, T> specialization -- if the two
+   // conditions ever diverge, the start tag is either never closed (a type
+   // matches here but the specialization below doesn't run, so nothing ever
+   // writes '>') or closed twice (the reverse).
+   template <class T>
+   concept xml_writes_own_start_tag_close = (glaze_object_t<T> || reflectable<T>) && !custom_write<T>;
+
    // Writes `<name ...attrs>body</name>` for a single element and is the ONLY
    // place that emits an element's start/end tags. Both write_xml (for the
    // document root) and the reflected-object writer's element pass (for every
@@ -131,12 +140,14 @@ namespace glz::xml::detail
    //
    // Attributes must land inside the start tag, before '>', so the two shapes
    // diverge on when '>' is written:
-   //  - Objects (glaze_object_t / reflectable) close their own start tag: their
-   //    to<XML, T>::op writes the attribute pass, then '>', then the body. This
-   //    function only supplies the outer <name> / </name> wrapper.
-   //  - Everything else (scalars, enums, ...) has no attributes, so this
-   //    function writes '>' itself immediately after the name and the value's
-   //    to<XML, T>::op only ever produces body text.
+   //  - Types matching xml_writes_own_start_tag_close close their own start
+   //    tag: their to<XML, T>::op writes the attribute pass, then '>', then
+   //    the body. This function only supplies the outer <name> / </name>
+   //    wrapper.
+   //  - Everything else (scalars, enums, custom_write types, ...) has no
+   //    attribute pass of this shape, so this function writes '>' itself
+   //    immediately after the name and the value's to<XML, T>::op only ever
+   //    produces body text.
    template <auto Opts, class T>
    void write_wrapped_element(std::string_view name, T&& value, is_context auto& ctx, auto& b, auto& ix)
    {
@@ -145,7 +156,7 @@ namespace glz::xml::detail
       append_raw("<", ctx, b, ix);
       append_raw(name, ctx, b, ix);
 
-      if constexpr (glaze_object_t<V> || reflectable<V>) {
+      if constexpr (xml_writes_own_start_tag_close<V>) {
          serialize<XML>::op<Opts>(std::forward<T>(value), ctx, b, ix);
       }
       else {
@@ -169,7 +180,7 @@ namespace glz
    // wrapper itself; xml::detail::write_wrapped_element owns that, so it can
    // be reused unchanged for both the document root and nested elements.
    template <class T>
-      requires((glaze_object_t<T> || reflectable<T>) && !custom_write<T>)
+      requires(xml::detail::xml_writes_own_start_tag_close<T>)
    struct to<XML, T>
    {
       template <auto Opts, class V, class B>
@@ -195,9 +206,11 @@ namespace glz
             }
          };
 
-         // Pass 1: attributes, then close the start tag. Non-sigil (element)
-         // keys are validated here too -- they're compile-time constants, so
-         // this is a static_assert rather than a runtime branch.
+         // Pass 1: attributes, then close the start tag. Both attribute and
+         // element keys are validated here -- they share the XML Name
+         // production, and keys are compile-time constants, so this is a
+         // static_assert rather than a runtime branch. "#text" is exempt: it
+         // names content, not an element or attribute.
          for_each<N>([&]<size_t I>() {
             if (bool(ctx.error)) [[unlikely]] {
                return;
@@ -205,6 +218,10 @@ namespace glz
             static constexpr auto key = glz::get<I>(reflect<T>::keys);
 
             if constexpr (xml::is_attribute_key(key)) {
+               if constexpr (xml::check_validate_names(Opts)) {
+                  static_assert(xml::validate_name(xml::strip_sigil(key)),
+                                "XML attribute name is not a valid XML Name");
+               }
                if (skip_member<Opts>(member.template operator()<I>())) {
                   return;
                }

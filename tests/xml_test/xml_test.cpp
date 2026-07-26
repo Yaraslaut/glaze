@@ -660,6 +660,87 @@ suite object_writing = [] {
       static_assert(glz::xml::strip_sigil("id") == "id");
       expect(true);
    };
+
+   "attribute_names_are_validated_too"_test = [] {
+      // Attribute and element names share the XML Name production. The guard
+      // itself is a static_assert in the writer (a bad name fails to compile),
+      // so this pins the underlying predicate the guard relies on.
+      static_assert(glz::xml::validate_name(glz::xml::strip_sigil("@id")));
+      static_assert(!glz::xml::validate_name(glz::xml::strip_sigil("@1bad")));
+      static_assert(glz::xml::validate_name(glz::xml::strip_sigil("@xml:lang")));
+      expect(true);
+   };
+};
+
+struct attr_child
+{
+   int a{};
+   std::string v{};
+};
+
+template <>
+struct glz::meta<attr_child>
+{
+   using T = attr_child;
+   static constexpr auto value = object("@a", &T::a, "v", &T::v);
+};
+
+struct attr_outer
+{
+   attr_child child{};
+};
+
+template <>
+struct glz::meta<attr_outer>
+{
+   using T = attr_outer;
+   static constexpr auto value = object("child", &T::child);
+};
+
+struct attrs_only
+{
+   int x{};
+   int y{};
+};
+
+template <>
+struct glz::meta<attrs_only>
+{
+   using T = attrs_only;
+   static constexpr auto value = object("@x", &T::x, "@y", &T::y);
+};
+
+struct empty_obj
+{
+   [[maybe_unused]] int unused_{};
+};
+
+template <>
+struct glz::meta<empty_obj>
+{
+   static constexpr auto value = object();
+};
+
+suite tag_ownership_edge_cases = [] {
+   "nested_object_with_its_own_attributes"_test = [] {
+      // The recursive element-pass call site, NOT the root one. This is where
+      // split responsibility for closing '>' is most likely to break.
+      const attr_outer o{.child = {.a = 5, .v = "hi"}};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(o, "outer").value_or("<error>");
+      expect(s == R"(<outer><child a="5"><v>hi</v></child></outer>)") << s;
+   };
+
+   "attributes_only_object"_test = [] {
+      const attrs_only o{.x = 1, .y = 2};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(o, "ao").value_or("<error>");
+      expect(s == R"(<ao x="1" y="2"></ao>)") << s;
+   };
+
+   "empty_object"_test = [] {
+      const empty_obj o{};
+      const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(o, "eo").value_or("<error>");
+      expect(s == "<eo></eo>") << s;
+   };
 };
 
 int main() {}
