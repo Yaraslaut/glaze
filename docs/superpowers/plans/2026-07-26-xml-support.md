@@ -2844,9 +2844,13 @@ start of a CDATA section:
 - Otherwise decode one UTF-8 scalar with `decode_utf8`; reject if the decode
   fails or `!is_xml_char(cp)`; append the raw bytes.
 
-`parse_cdata` consumes `<![CDATA[`, copies bytes verbatim until `]]>`, and sets
+`parse_cdata` consumes `<![CDATA[`, copies bytes until `]]>`, and sets
 `error_code::unexpected_end` if the terminator is missing. Characters inside
-CDATA still must satisfy `is_xml_char`, but references and `]]` are literal.
+CDATA still must satisfy `is_xml_char`, and references and `]]` are literal —
+but **line-ending normalization still applies**. XML 1.0 §2.11 defines
+normalization as a whole-document preprocessing step performed *before*
+parsing, so it precedes CDATA's markup suppression. Confirmed against xmllint:
+`<a><![CDATA[x\r\ny]]></a>` and `<a>x\r\ny</a>` both yield `x\ny`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
