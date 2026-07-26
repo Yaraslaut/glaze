@@ -868,7 +868,11 @@ suite entities_and_escaping = [] {
    "numeric_character_references"_test = [decode_all] {
       expect(decode_all("&#65;") == std::pair{true, std::string{"A"}});
       expect(decode_all("&#x41;") == std::pair{true, std::string{"A"}});
-      expect(decode_all("&#X41;") == std::pair{true, std::string{"A"}});
+      // XML 1.0 [66] CharRef spells the hex marker '&#x' in LOWERCASE only.
+      // W3C conformance case not-wf-sa-093 (<doc>&#X58;</doc>, section 4.1 [66])
+      // exists precisely to reject the uppercase form, and xmllint rejects it
+      // too. Accepting it would fail that case in Tasks 15 and 17.
+      expect(decode_all("&#X41;").first == false);
       expect(decode_all("&#233;") == std::pair{true, std::string{"\xC3\xA9"}});
       expect(decode_all("&#x20AC;") == std::pair{true, std::string{"\xE2\x82\xAC"}});
       expect(decode_all("&#128512;") == std::pair{true, std::string{"\xF0\x9F\x98\x80"}});
@@ -1030,7 +1034,11 @@ Append inside `namespace glz::xml` in `include/glaze/xml/common.hpp`:
          if (p >= end) return false;
 
          int base = 10;
-         if (*p == 'x' || *p == 'X') {
+         // Lowercase 'x' ONLY. XML 1.0 [66] CharRef is
+         //   '&#' [0-9]+ ';' | '&#x' [0-9a-fA-F]+ ';'
+         // so "&#X41;" is not well-formed. W3C case not-wf-sa-093 tests exactly
+         // this. Accepting 'X' here silently admits malformed documents.
+         if (*p == 'x') {
             base = 16;
             ++p;
          }
@@ -3509,6 +3517,12 @@ suite xmltest_not_wf = [] {
    };
    "not-wf-sa-085: illegal character in comment"_test = [] {
       expect(rejects(R"(<doc><!-- a -- b --></doc>)"));
+   };
+   "not-wf-sa-093: hex char refs may not use uppercase 'X'"_test = [] {
+      // XML 1.0 section 4.1 [66] spells the marker '&#x' in lowercase only.
+      expect(rejects(R"(<doc>&#X58;</doc>)"));
+      // The lowercase form is well-formed.
+      expect(accepts(R"(<doc>&#x58;</doc>)"));
    };
    "not-wf-sa-140: name starts with a combining character"_test = [] {
       expect(rejects("<doc>\xCC\x80x</doc>"));
