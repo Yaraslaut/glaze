@@ -497,4 +497,115 @@ namespace glz::xml
       it = p;
       return true;
    }
+
+   // CData ::= (Char* - (Char* ']]>' Char*))
+   // CDSect ::= '<![CDATA[' CData ']]>'
+   //
+   // Bytes are copied verbatim -- no reference expansion, and ']]' is only
+   // forbidden immediately before '>'. Per XML 1.0 2.11, line-ending
+   // normalization (a literal CRLF or lone CR becomes LF) is a preprocessing
+   // step applied across the whole document before parsing, so it still
+   // applies here even though CDATA otherwise suppresses markup recognition.
+   inline bool parse_cdata(const char*& it, const char* end, xml_context& ctx, std::string& out) noexcept
+   {
+      constexpr std::string_view open = "<![CDATA[";
+      if (size_t(end - it) < open.size() || std::string_view{it, open.size()} != open) {
+         ctx.error = error_code::syntax_error;
+         return false;
+      }
+
+      const char* p = it + open.size();
+      while (true) {
+         if (p >= end) {
+            ctx.error = error_code::unexpected_end;
+            return false;
+         }
+         if (*p == ']' && (p + 2) < end && p[1] == ']' && p[2] == '>') {
+            it = p + 3;
+            return true;
+         }
+         if (*p == '\r') {
+            out.push_back('\n');
+            ++p;
+            if (p < end && *p == '\n') {
+               ++p;
+            }
+            continue;
+         }
+
+         char32_t cp{};
+         const size_t n = decode_utf8(p, end, cp);
+         if (n == 0 || !is_xml_char(cp)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         out.append(p, n);
+         p += n;
+      }
+   }
+
+   // CharData ::= [^<&]* - ([^<&]* ']]>' [^<&]*)
+   // content ::= CharData? ((element | Reference | CDSect | PI | Comment) CharData?)*
+   //
+   // Handles the subset relevant to a text node: CDATA sections merge
+   // seamlessly into the surrounding text, references expand, and a literal
+   // line ending normalizes (XML 1.0 2.11). Normalization applies only to
+   // literal bytes -- a character reference such as '&#xD;' names an actual
+   // carriage return and must survive untouched, mirroring the attribute-value
+   // asymmetry in parse_attribute_value above (decode_reference writes
+   // straight into 'out', bypassing the '\r' handling below). Stops, without
+   // consuming, at any '<' that does not open a CDATA section, leaving the
+   // caller to dispatch on tag, comment, PI, etc.
+   inline bool parse_char_data(const char*& it, const char* end, xml_context& ctx, std::string& out) noexcept
+   {
+      out.clear();
+      constexpr std::string_view cdata_open = "<![CDATA[";
+
+      while (it < end) {
+         const char c = *it;
+
+         if (c == '<') {
+            if (size_t(end - it) >= cdata_open.size() && std::string_view{it, cdata_open.size()} == cdata_open) {
+               if (!parse_cdata(it, end, ctx, out)) {
+                  return false;
+               }
+               continue;
+            }
+            return true; // markup begins here -- leave it on '<'
+         }
+
+         if (c == '&') {
+            if (!decode_reference(it, end, out)) {
+               ctx.error = error_code::syntax_error;
+               return false;
+            }
+            continue;
+         }
+
+         if (c == '\r') {
+            out.push_back('\n');
+            ++it;
+            if (it < end && *it == '\n') {
+               ++it;
+            }
+            continue;
+         }
+
+         if (c == ']' && (it + 2) < end && it[1] == ']' && it[2] == '>') {
+            ctx.error = error_code::syntax_error; // bare ']]>' forbidden in character data
+            return false;
+         }
+
+         char32_t cp{};
+         const size_t n = decode_utf8(it, end, cp);
+         if (n == 0 || !is_xml_char(cp)) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
+         out.append(it, n);
+         it += n;
+      }
+
+      return true;
+   }
 }

@@ -1448,4 +1448,80 @@ suite element_parsing = [] {
    };
 };
 
+namespace
+{
+   std::pair<bool, std::string> read_char_data(std::string_view s)
+   {
+      glz::xml::xml_context ctx{};
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      std::string out{};
+      const bool ok = glz::xml::parse_char_data(it, end, ctx, out) && !bool(ctx.error);
+      return {ok, out};
+   }
+}
+
+suite char_data_parsing = [] {
+   "plain_text"_test = [] {
+      expect(read_char_data("hello") == std::pair{true, std::string{"hello"}});
+      expect(read_char_data("hello</a>") == std::pair{true, std::string{"hello"}});
+      expect(read_char_data("") == std::pair{true, std::string{""}});
+   };
+
+   "entities_expanded_in_text"_test = [] {
+      expect(read_char_data("a&amp;b") == std::pair{true, std::string{"a&b"}});
+      expect(read_char_data("&lt;tag&gt;") == std::pair{true, std::string{"<tag>"}});
+      expect(read_char_data("&#65;&#x42;") == std::pair{true, std::string{"AB"}});
+   };
+
+   "cdata_is_literal"_test = [] {
+      expect(read_char_data("<![CDATA[a&b<c]]>") == std::pair{true, std::string{"a&b<c"}});
+      expect(read_char_data("<![CDATA[]]>") == std::pair{true, std::string{""}});
+      // CDATA merges into surrounding text.
+      expect(read_char_data("x<![CDATA[&y]]>z") == std::pair{true, std::string{"x&yz"}});
+      // ']]' inside CDATA is fine as long as it is not followed by '>'.
+      expect(read_char_data("<![CDATA[a]]b]]>") == std::pair{true, std::string{"a]]b"}});
+   };
+
+   "unterminated_cdata_rejected"_test = [] { expect(!read_char_data("<![CDATA[abc").first); };
+
+   "bare_cdata_end_rejected_in_text"_test = [] {
+      // ']]>' may not appear literally in character data.
+      expect(!read_char_data("a]]>b").first);
+   };
+
+   "line_ending_normalization"_test = [] {
+      expect(read_char_data("a\r\nb") == std::pair{true, std::string{"a\nb"}});
+      expect(read_char_data("a\rb") == std::pair{true, std::string{"a\nb"}});
+      expect(read_char_data("a\nb") == std::pair{true, std::string{"a\nb"}});
+      expect(read_char_data("a\r\r\nb") == std::pair{true, std::string{"a\n\nb"}});
+   };
+
+   "undeclared_entity_rejected"_test = [] {
+      // We skip rather than expand the internal DTD subset, so any general
+      // entity beyond the five predefined ones is undeclared.
+      expect(!read_char_data("a&custom;b").first);
+   };
+
+   "illegal_raw_characters_rejected"_test = [] {
+      expect(!read_char_data(std::string_view{"a\x01"
+                                              "b",
+                                              3})
+                 .first);
+      expect(!read_char_data(std::string_view{"a\0b", 3}).first);
+   };
+
+   "stops_at_markup"_test = [] {
+      std::string_view s = "text<child/>";
+      const char* it = s.data();
+      const char* const end = it + s.size();
+      glz::xml::xml_context ctx{};
+      std::string out{};
+      expect(glz::xml::parse_char_data(it, end, ctx, out));
+      expect(out == "text");
+      expect(*it == '<');
+      expect(size_t(it - s.data()) == size_t(4));
+   };
+};
+
 int main() {}
