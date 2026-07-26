@@ -168,6 +168,26 @@ namespace glz::xml::detail
       append_raw(name, ctx, b, ix);
       append_raw(">", ctx, b, ix);
    }
+
+   // Writes a sequence as repeated sibling elements -- <name>item</name> for
+   // each item, with no wrapper of its own around the sequence. `name` comes
+   // from the enclosing struct member key (or map key), which is a runtime
+   // value here even though it is a compile-time constant at the call site in
+   // the object writer, so it is threaded as an ordinary std::string_view
+   // parameter rather than through Opts (which must stay structural, usable
+   // as `template <auto Opts>`). Every item still goes through
+   // write_wrapped_element above, so a given tag is still written in exactly
+   // one place. An empty sequence writes nothing at all, not an empty element.
+   template <auto Opts, class T>
+   void write_sequence(std::string_view name, T&& value, is_context auto& ctx, auto& b, auto& ix)
+   {
+      for (auto&& item : value) {
+         if (bool(ctx.error)) [[unlikely]] {
+            return;
+         }
+         write_wrapped_element<Opts>(name, item, ctx, b, ix);
+      }
+   }
 }
 
 namespace glz
@@ -257,10 +277,75 @@ namespace glz
             else if constexpr (xml::is_text_key(key)) {
                serialize<XML>::op<xml::attribute_pass_off<Opts>()>(member.template operator()<I>(), ctx, b, ix);
             }
+            else if constexpr (writable_array_t<std::remove_cvref_t<decltype(member.template operator()<I>())>>) {
+               // Repeated-sibling convention: a sequence member does not get a
+               // wrapper element of its own. The tag repeats once per item, so
+               // this bypasses write_wrapped_element for the member as a whole
+               // and hands the key down to write_sequence instead, which calls
+               // write_wrapped_element once per item.
+               xml::detail::write_sequence<Opts>(key, member.template operator()<I>(), ctx, b, ix);
+            }
             else {
                xml::detail::write_wrapped_element<Opts>(key, member.template operator()<I>(), ctx, b, ix);
             }
          });
+      }
+   };
+}
+
+namespace glz
+{
+   // Sequence writer for positions that are not a struct member (so no
+   // enclosing key is available to repeat as the sibling tag name): a nested
+   // sequence inside another sequence, or the mapped value of a
+   // writable_map_t entry. Without a name to repeat, this only writes each
+   // item's body content back to back with no tags of its own -- the named,
+   // repeated-sibling form the format actually wants is produced by the
+   // object writer's member loop above, which special-cases sequence members
+   // and calls xml::detail::write_sequence directly instead of going through
+   // this specialization.
+   template <class T>
+      requires(writable_array_t<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         for (auto&& item : value) {
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            serialize<XML>::op<Opts>(item, ctx, b, ix);
+         }
+      }
+   };
+
+   // Maps write each entry as an element named after its key: a std::map with
+   // key "alpha" and value 1 becomes <alpha>1</alpha>. Map keys are runtime
+   // values (unlike struct member keys, which are compile-time constants), so
+   // validation is a runtime check that sets ctx.error rather than a
+   // static_assert.
+   template <class T>
+      requires(writable_map_t<T>)
+   struct to<XML, T>
+   {
+      template <auto Opts, class B>
+      static void op(auto&& value, is_context auto&& ctx, B&& b, auto&& ix)
+      {
+         for (auto&& [key, mapped] : value) {
+            if (bool(ctx.error)) [[unlikely]] {
+               return;
+            }
+            const std::string_view key_sv{key};
+            if constexpr (xml::check_validate_names(Opts)) {
+               if (!xml::validate_name(key_sv)) [[unlikely]] {
+                  ctx.error = error_code::syntax_error;
+                  ctx.custom_error_message = "map key is not a valid XML Name";
+                  return;
+               }
+            }
+            xml::detail::write_wrapped_element<Opts>(key_sv, mapped, ctx, b, ix);
+         }
       }
    };
 }
@@ -288,6 +373,14 @@ namespace glz
    template <auto Opts = xml::xml_opts{}, class T, output_buffer Buffer>
    [[nodiscard]] error_ctx write_xml(T&& value, Buffer& buffer, std::string_view root_name = "root") noexcept
    {
+      // A bare sequence at the document root would repeat its wrapper tag once
+      // per item (the repeated-sibling convention that makes sense for a
+      // struct member), producing multiple root elements -- not well-formed
+      // XML. Maps are unaffected: writable_array_t excludes writable_map_t.
+      if constexpr (writable_array_t<std::remove_cvref_t<T>>) {
+         return error_ctx{0, error_code::syntax_error, "a sequence cannot be the document root; wrap it in a struct"};
+      }
+
       const auto name = xml::resolve_root_name<T>(root_name);
 
       if constexpr (xml::check_validate_names(Opts)) {

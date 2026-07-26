@@ -8,9 +8,11 @@
 #include <concepts>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "ut/ut.hpp"
 
@@ -740,6 +742,86 @@ suite tag_ownership_edge_cases = [] {
       const empty_obj o{};
       const auto s = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(o, "eo").value_or("<error>");
       expect(s == "<eo></eo>") << s;
+   };
+};
+
+struct xml_shelf
+{
+   std::string name{};
+   std::vector<int> tag{};
+};
+
+template <>
+struct glz::meta<xml_shelf>
+{
+   using T = xml_shelf;
+   static constexpr auto value = object("name", &T::name, "tag", &T::tag);
+};
+
+struct xml_library
+{
+   std::vector<xml_book> book{};
+};
+
+template <>
+struct glz::meta<xml_library>
+{
+   using T = xml_library;
+   static constexpr auto value = object("book", &T::book);
+};
+
+suite container_writing = [] {
+   "vector_of_scalars_repeats_the_member_tag"_test = [] {
+      const xml_shelf s{.name = "a", .tag = {1, 2, 3}};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(s, "shelf").value_or("<error>");
+      expect(out == "<shelf><name>a</name><tag>1</tag><tag>2</tag><tag>3</tag></shelf>") << out;
+   };
+
+   "empty_vector_emits_nothing"_test = [] {
+      const xml_shelf s{.name = "a", .tag = {}};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(s, "shelf").value_or("<error>");
+      expect(out == "<shelf><name>a</name></shelf>") << out;
+   };
+
+   "single_element_vector_still_emits_one_tag"_test = [] {
+      const xml_shelf s{.name = "a", .tag = {9}};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(s, "shelf").value_or("<error>");
+      expect(out == "<shelf><name>a</name><tag>9</tag></shelf>") << out;
+   };
+
+   "vector_of_structs"_test = [] {
+      const xml_library lib{.book = {{.title = "A", .year = 1}, {.title = "B", .year = 2}}};
+      const auto out =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(lib, "library").value_or("<error>");
+      expect(out ==
+             "<library><book><title>A</title><year>1</year></book>"
+             "<book><title>B</title><year>2</year></book></library>")
+         << out;
+   };
+
+   "map_keys_become_element_names"_test = [] {
+      const std::map<std::string, int> m{{"alpha", 1}, {"beta", 2}};
+      const auto out = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(m, "m").value_or("<error>");
+      expect(out == "<m><alpha>1</alpha><beta>2</beta></m>") << out;
+   };
+
+   "map_key_that_is_not_a_valid_name_is_rejected"_test = [] {
+      // Map keys are runtime values, so this is a runtime check, unlike struct
+      // member keys which are validated at compile time.
+      const std::map<std::string, int> m{{"1bad", 1}};
+      const auto r = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(m, "m");
+      expect(!r.has_value()) << "invalid element names must never be emitted";
+      if (!r.has_value()) {
+         expect(r.error() == glz::error_code::syntax_error);
+      }
+   };
+
+   "nested_vector_inside_vector_of_structs"_test = [] {
+      const std::vector<xml_shelf> shelves{{.name = "s1", .tag = {1}}, {.name = "s2", .tag = {2, 3}}};
+      std::string out;
+      const auto ec = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(shelves, out, "shelf");
+      // A bare top-level sequence would produce multiple root elements.
+      expect(bool(ec)) << "top-level sequence must be rejected: " << out;
    };
 };
 
