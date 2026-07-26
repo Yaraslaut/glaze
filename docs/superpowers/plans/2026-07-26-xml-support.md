@@ -5444,8 +5444,18 @@ Cover, with runnable examples lifted from the passing tests:
    because options must be structural types.
 6. **Options** — a table of every `xml_opts` field with its default.
 7. **`glz::generic`** — the untyped path, and a clearly-marked **Limitations**
-   section covering the repeated-element count heuristic (one occurrence → value,
-   two or more → array).
+   section covering:
+   - the repeated-element count heuristic (one occurrence → value, two or more
+     → array);
+   - **nested containers are not supported**. The repeated-sibling convention
+     takes an element name from the enclosing struct member key, and a sequence
+     nested in another sequence — or a sequence used as a map's mapped value —
+     has no such key. `write_xml` reports `error_code::syntax_error` for these
+     rather than emitting output: writing the item bodies back to back is
+     well-formed XML but silently fuses the items
+     (`vector<vector<int>>{{1,2},{3,4}}` → `<m>12</m><m>34</m>`), which is
+     unrecoverable on read-back. Wrap the inner sequence in a struct so its
+     items have a name.
 8. **Conformance** — what is implemented (XML 1.0 5th ed. well-formedness,
    namespaces) and what is not (DTD validation, external entities, XML 1.1).
    State explicitly that parsing never touches the network or filesystem.
