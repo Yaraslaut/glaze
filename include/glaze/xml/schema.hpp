@@ -14,6 +14,8 @@
 #include "glaze/core/common.hpp"
 #include "glaze/core/context.hpp"
 #include "glaze/core/reflect.hpp"
+#include "glaze/core/schema.hpp" // glz::schema, glz::detail::defined_formats
+#include "glaze/core/write_chars.hpp" // glz::write_chars -- numeric facet values
 #include "glaze/util/for_each.hpp"
 #include "glaze/util/variant.hpp"
 #include "glaze/xml/common.hpp"
@@ -185,6 +187,463 @@ namespace glz::xml
          append_raw("</xs:choice></xs:complexType></xs:element>", ctx, b, ix);
       }
 
+      // ------------------------------------------------------------------
+      // Task 21: mapping glz::schema facets (Task 18's shared JSON/XSD
+      // metadata type) onto XSD restrictions. The same glz::json_schema<T>
+      // (or in-struct glaze_json_schema) specialization that feeds
+      // glz::write_json_schema also drives this -- see glz::json_schema_t
+      // and glz::json_schema_type in core/meta.hpp for the detection
+      // machinery, reused verbatim rather than re-implemented here.
+
+      // Whether member I of T has a corresponding glz::schema entry.
+      template <class T, size_t I>
+      consteval bool has_member_schema()
+      {
+         if constexpr (glz::json_schema_t<T>) {
+            constexpr auto schema_size = reflect<json_schema_type<T>>::size;
+            if constexpr (schema_size > 0) {
+               constexpr auto key = reflect<T>::keys[I];
+               constexpr auto& schema_keys = reflect<json_schema_type<T>>::keys;
+               for (size_t i = 0; i < schema_size; ++i) {
+                  if (schema_keys[i] == key) return true;
+               }
+            }
+         }
+         return false;
+      }
+
+      // The index of member I's key within json_schema_type<T>::keys. Only
+      // valid -- and only ever called -- when has_member_schema<T, I>() is
+      // true.
+      template <class T, size_t I>
+         requires(has_member_schema<T, I>())
+      consteval size_t member_schema_index()
+      {
+         constexpr auto key = reflect<T>::keys[I];
+         constexpr auto& schema_keys = reflect<json_schema_type<T>>::keys;
+         constexpr auto schema_size = reflect<json_schema_type<T>>::size;
+         for (size_t i = 0; i < schema_size; ++i) {
+            if (schema_keys[i] == key) return i;
+         }
+         return schema_size; // unreachable: has_member_schema<T, I>() guarantees a match
+      }
+
+      // Copies out the glz::schema authored for member I of T. Mirrors the
+      // lookup in glaze/json/schema.hpp's to_json_schema<T>::op, right down
+      // to the "static const instance, copy the member out" pattern -- glz::schema
+      // holds heap-allocated (boxed) fields, so it cannot be built at compile time.
+      template <class T, size_t I>
+         requires(has_member_schema<T, I>())
+      schema get_member_schema()
+      {
+         static constexpr auto idx = member_schema_index<T, I>();
+         static const auto schema_v = json_schema_type<T>{};
+         return get<idx>(to_tie(schema_v));
+      }
+
+      // Facets that only make sense inside an <xs:restriction> -- their
+      // presence is what forces a member from a bare type="..." attribute
+      // to an inline <xs:simpleType>.
+      inline bool has_restriction_facets(const schema& s) noexcept
+      {
+         return bool(s.minimum) || bool(s.maximum) || bool(s.exclusiveMinimum) || bool(s.exclusiveMaximum) ||
+                bool(s.minLength) || bool(s.maxLength) || s.pattern.has_value() || bool(s.enumeration);
+      }
+
+      // The XSD built-in type for a defined_formats value, or empty when
+      // XSD has no matching built-in (the caller falls back to xs:string).
+      constexpr std::string_view xsd_format_builtin(glz::detail::defined_formats fmt) noexcept
+      {
+         using enum glz::detail::defined_formats;
+         switch (fmt) {
+         case datetime:
+            return "xs:dateTime";
+         case date:
+            return "xs:date";
+         case time:
+            return "xs:time";
+         case duration:
+            return "xs:duration";
+         case uri:
+         case uri_reference:
+            return "xs:anyURI";
+         default:
+            return {};
+         }
+      }
+
+      // A best-effort xs:pattern approximation for a defined_formats value
+      // that has no XSD built-in type. These are intentionally loose --
+      // the point is to give the reader *something* to validate against,
+      // not to fully replicate JSON Schema's format semantics.
+      constexpr std::string_view format_pattern_approximation(glz::detail::defined_formats fmt) noexcept
+      {
+         using enum glz::detail::defined_formats;
+         switch (fmt) {
+         case email:
+         case idn_email:
+            return R"([^@\s]+@[^@\s]+)";
+         case hostname:
+         case idn_hostname:
+            return R"([^\s]+)";
+         case ipv4:
+            return R"(\d{1,3}(\.\d{1,3}){3})";
+         case ipv6:
+            return R"([0-9a-fA-F:]+)";
+         case uuid:
+            return R"([0-9a-fA-F-]{36})";
+         default:
+            return R"(.*)";
+         }
+      }
+
+      // Writes a schema_number's held alternative (int64_t/uint64_t/double) as
+      // raw digits -- numbers cannot contain XML metacharacters, so no escaping
+      // is needed, only the same ensure_space growth every writer here uses.
+      template <class B>
+      void write_schema_number(const schema::schema_number& n, is_context auto& ctx, B& b, auto& ix)
+      {
+         if (!ensure_space(ctx, b, ix + 64 + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         std::visit([&](auto&& v) { write_chars::op<glz::opts{}>(v, ctx, b, ix); }, *n);
+      }
+
+      template <class B>
+      void write_u64(uint64_t v, is_context auto& ctx, B& b, auto& ix)
+      {
+         if (!ensure_space(ctx, b, ix + 32 + write_padding_bytes)) [[unlikely]] {
+            return;
+         }
+         write_chars::op<glz::opts{}>(v, ctx, b, ix);
+      }
+
+      // Renders a schema_any (defaultValue/constant) as an *attribute* value.
+      template <class B>
+      void write_schema_any_attr(const schema::schema_any& v, is_context auto& ctx, B& b, auto& ix)
+      {
+         std::visit(
+            [&](auto&& val) {
+               using VT = std::decay_t<decltype(val)>;
+               if constexpr (std::same_as<VT, std::monostate>) {
+                  // No lexical representation; callers skip emitting the attribute entirely.
+               }
+               else if constexpr (std::same_as<VT, bool>) {
+                  append_raw(val ? "true" : "false", ctx, b, ix);
+               }
+               else if constexpr (std::same_as<VT, std::string_view>) {
+                  xml::escape_attribute(val, ctx, b, ix);
+               }
+               else {
+                  if (!ensure_space(ctx, b, ix + 64 + write_padding_bytes)) [[unlikely]] {
+                     return;
+                  }
+                  write_chars::op<glz::opts{}>(val, ctx, b, ix);
+               }
+            },
+            v);
+      }
+
+      // Renders a schema_any (constant, in appinfo) as *text* content.
+      template <class B>
+      void write_schema_any_text(const schema::schema_any& v, is_context auto& ctx, B& b, auto& ix)
+      {
+         std::visit(
+            [&](auto&& val) {
+               using VT = std::decay_t<decltype(val)>;
+               if constexpr (std::same_as<VT, std::monostate>) {
+                  append_raw("null", ctx, b, ix);
+               }
+               else if constexpr (std::same_as<VT, bool>) {
+                  append_raw(val ? "true" : "false", ctx, b, ix);
+               }
+               else if constexpr (std::same_as<VT, std::string_view>) {
+                  xml::escape_text(val, ctx, b, ix);
+               }
+               else {
+                  if (!ensure_space(ctx, b, ix + 64 + write_padding_bytes)) [[unlikely]] {
+                     return;
+                  }
+                  write_chars::op<glz::opts{}>(val, ctx, b, ix);
+               }
+            },
+            v);
+      }
+
+      // default="..." attribute, from defaultValue. Skipped for a monostate
+      // (JSON "null") value: XSD's default attribute has no lexical form for it.
+      template <class B>
+      void write_default_attr(const schema::schema_any& v, is_context auto& ctx, B& b, auto& ix)
+      {
+         if (std::holds_alternative<std::monostate>(v)) {
+            return;
+         }
+         append_raw(" default=\"", ctx, b, ix);
+         write_schema_any_attr(v, ctx, b, ix);
+         append_raw("\"", ctx, b, ix);
+      }
+
+      // Whether any facet with no XSD equivalent is present (multipleOf,
+      // uniqueItems, constant, readOnly/writeOnly, min/maxProperties,
+      // min/maxContains, deprecated -- and, for non-array members,
+      // min/maxItems, which only maps onto element cardinality for arrays).
+      // These have nowhere else to go, so they are folded into <xs:appinfo>
+      // rather than silently dropped.
+      inline bool has_appinfo_content(const schema& s, bool format_needs_fallback, bool is_array) noexcept
+      {
+         return format_needs_fallback || bool(s.multipleOf) || s.uniqueItems.has_value() || bool(s.constant) ||
+                s.readOnly.has_value() || s.writeOnly.has_value() || bool(s.minProperties) || bool(s.maxProperties) ||
+                bool(s.minContains) || bool(s.maxContains) || s.deprecated.has_value() ||
+                (!is_array && (bool(s.minItems) || bool(s.maxItems)));
+      }
+
+      template <bool IsArray, class B>
+      void write_appinfo_body(const schema& s, bool format_needs_fallback, is_context auto& ctx, B& b, auto& ix)
+      {
+         append_raw("<xs:appinfo>", ctx, b, ix);
+         bool wrote_any = false;
+         auto sep = [&] {
+            if (wrote_any) append_raw("; ", ctx, b, ix);
+            wrote_any = true;
+         };
+         auto kv_text = [&](std::string_view key, std::string_view text) {
+            sep();
+            append_raw(key, ctx, b, ix);
+            append_raw("=", ctx, b, ix);
+            xml::escape_text(text, ctx, b, ix);
+         };
+         auto kv_bool = [&](std::string_view key, bool v) {
+            sep();
+            append_raw(key, ctx, b, ix);
+            append_raw(v ? "=true" : "=false", ctx, b, ix);
+         };
+         auto kv_u64 = [&](std::string_view key, uint64_t v) {
+            sep();
+            append_raw(key, ctx, b, ix);
+            append_raw("=", ctx, b, ix);
+            write_u64(v, ctx, b, ix);
+         };
+         auto kv_number = [&](std::string_view key, const schema::schema_number& n) {
+            sep();
+            append_raw(key, ctx, b, ix);
+            append_raw("=", ctx, b, ix);
+            write_schema_number(n, ctx, b, ix);
+         };
+
+         if (format_needs_fallback) {
+            kv_text("format", get_enum_name(*s.format));
+         }
+         if (s.multipleOf) kv_number("multipleOf", s.multipleOf);
+         if (s.uniqueItems) kv_bool("uniqueItems", *s.uniqueItems);
+         if (s.constant) {
+            sep();
+            append_raw("constant=", ctx, b, ix);
+            write_schema_any_text(*s.constant, ctx, b, ix);
+         }
+         if (s.readOnly) kv_bool("readOnly", *s.readOnly);
+         if (s.writeOnly) kv_bool("writeOnly", *s.writeOnly);
+         if (s.minProperties) kv_u64("minProperties", *s.minProperties);
+         if (s.maxProperties) kv_u64("maxProperties", *s.maxProperties);
+         if (s.minContains) kv_u64("minContains", *s.minContains);
+         if (s.maxContains) kv_u64("maxContains", *s.maxContains);
+         if (s.deprecated) kv_bool("deprecated", *s.deprecated);
+         if constexpr (!IsArray) {
+            if (s.minItems) kv_u64("minItems", *s.minItems);
+            if (s.maxItems) kv_u64("maxItems", *s.maxItems);
+         }
+
+         append_raw("</xs:appinfo>", ctx, b, ix);
+      }
+
+      // The base type used for a faceted member's type="..." attribute (no
+      // restriction facets) or its <xs:restriction base="...">: format
+      // substitution takes priority over the ordinary named-type/builtin
+      // resolution, since a JSON Schema `format` describes the same
+      // underlying string more precisely than xs:string alone can.
+      template <class Inner, class B>
+      void write_facet_base_type(const schema& s, bool format_has_builtin, is_context auto& ctx, B& b, auto& ix)
+      {
+         if (s.format) {
+            if (format_has_builtin) {
+               append_raw(xsd_format_builtin(*s.format), ctx, b, ix);
+            }
+            else {
+               append_raw("xs:string", ctx, b, ix);
+            }
+         }
+         else {
+            write_type_ref<Inner>(ctx, b, ix);
+         }
+      }
+
+      // Children of <xs:restriction base="...">: every restriction-only
+      // facet, plus a pattern approximation when `format` has no XSD
+      // built-in (an explicit user `pattern` always wins).
+      template <class B>
+      void write_restriction_body(const schema& s, std::string_view format_pattern, is_context auto& ctx, B& b,
+                                  auto& ix)
+      {
+         if (s.minimum) {
+            append_raw("<xs:minInclusive value=\"", ctx, b, ix);
+            write_schema_number(s.minimum, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.maximum) {
+            append_raw("<xs:maxInclusive value=\"", ctx, b, ix);
+            write_schema_number(s.maximum, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.exclusiveMinimum) {
+            append_raw("<xs:minExclusive value=\"", ctx, b, ix);
+            write_schema_number(s.exclusiveMinimum, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.exclusiveMaximum) {
+            append_raw("<xs:maxExclusive value=\"", ctx, b, ix);
+            write_schema_number(s.exclusiveMaximum, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.minLength) {
+            append_raw("<xs:minLength value=\"", ctx, b, ix);
+            write_u64(*s.minLength, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.maxLength) {
+            append_raw("<xs:maxLength value=\"", ctx, b, ix);
+            write_u64(*s.maxLength, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.pattern) {
+            append_raw("<xs:pattern value=\"", ctx, b, ix);
+            xml::escape_attribute(*s.pattern, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         else if (!format_pattern.empty()) {
+            append_raw("<xs:pattern value=\"", ctx, b, ix);
+            xml::escape_attribute(format_pattern, ctx, b, ix);
+            append_raw("\"/>", ctx, b, ix);
+         }
+         if (s.enumeration) {
+            for (const auto& e : *s.enumeration) {
+               append_raw("<xs:enumeration value=\"", ctx, b, ix);
+               xml::escape_attribute(e, ctx, b, ix);
+               append_raw("\"/>", ctx, b, ix);
+            }
+         }
+      }
+
+      // Lazily resolves an array member's element type: range_value_t is
+      // concept-constrained and would hard-fail if evaluated against a
+      // non-range D, so the NTTP keeps that instantiation from ever
+      // happening for the (far more common) non-array case.
+      template <class D, bool = writable_array_t<D>>
+      struct facet_range_value
+      {
+         using type = D;
+      };
+
+      template <class D>
+      struct facet_range_value<D, true>
+      {
+         using type = std::remove_cvref_t<range_value_t<D>>;
+      };
+
+      template <class D>
+      using facet_range_value_t = typename facet_range_value<D>::type;
+
+      // Renders a non-variant member that carries a glz::schema entry.
+      // Cardinality (minOccurs/maxOccurs) still follows the member's C++
+      // shape (array/nullable/plain), same as the unfaceted write_xsd_element,
+      // except that minItems/maxItems override an array's default bounds.
+      template <class D, class B>
+      void write_xsd_faceted_scalar_element(std::string_view name, const schema& s, is_context auto& ctx, B& b,
+                                            auto& ix)
+      {
+         constexpr bool is_array = writable_array_t<D>;
+         constexpr bool is_opt = nullable_like<D>;
+         using Inner = std::conditional_t<is_array, facet_range_value_t<D>, schema_unwrap_nullable_t<D>>;
+
+         const bool format_has_builtin = bool(s.format) && !xsd_format_builtin(*s.format).empty();
+         const bool format_needs_fallback = bool(s.format) && !format_has_builtin;
+         const std::string_view format_pattern =
+            format_needs_fallback ? format_pattern_approximation(*s.format) : std::string_view{};
+         const bool has_restriction = has_restriction_facets(s) || format_needs_fallback;
+         const bool doc_needed = s.title.has_value() || s.description.has_value();
+         const bool appinfo_needed = has_appinfo_content(s, format_needs_fallback, is_array);
+         const bool needs_body = doc_needed || appinfo_needed || has_restriction;
+
+         append_raw("<xs:element name=\"", ctx, b, ix);
+         append_raw(name, ctx, b, ix);
+         append_raw("\"", ctx, b, ix);
+
+         if constexpr (is_array) {
+            append_raw(" minOccurs=\"", ctx, b, ix);
+            if (s.minItems) {
+               write_u64(*s.minItems, ctx, b, ix);
+            }
+            else {
+               append_raw("0", ctx, b, ix);
+            }
+            append_raw("\" maxOccurs=\"", ctx, b, ix);
+            if (s.maxItems) {
+               write_u64(*s.maxItems, ctx, b, ix);
+            }
+            else {
+               append_raw("unbounded", ctx, b, ix);
+            }
+            append_raw("\"", ctx, b, ix);
+         }
+         else if constexpr (is_opt) {
+            append_raw(" minOccurs=\"0\"", ctx, b, ix);
+         }
+
+         if (!has_restriction) {
+            append_raw(" type=\"", ctx, b, ix);
+            write_facet_base_type<Inner>(s, format_has_builtin, ctx, b, ix);
+            append_raw("\"", ctx, b, ix);
+
+            if constexpr (!is_array) {
+               if (s.defaultValue) {
+                  write_default_attr(*s.defaultValue, ctx, b, ix);
+               }
+            }
+         }
+
+         if (!needs_body) {
+            append_raw("/>", ctx, b, ix);
+            return;
+         }
+         append_raw(">", ctx, b, ix);
+
+         if (doc_needed || appinfo_needed) {
+            append_raw("<xs:annotation>", ctx, b, ix);
+            if (s.title) {
+               append_raw("<xs:documentation>", ctx, b, ix);
+               xml::escape_text(*s.title, ctx, b, ix);
+               append_raw("</xs:documentation>", ctx, b, ix);
+            }
+            if (s.description) {
+               append_raw("<xs:documentation>", ctx, b, ix);
+               xml::escape_text(*s.description, ctx, b, ix);
+               append_raw("</xs:documentation>", ctx, b, ix);
+            }
+            if (appinfo_needed) {
+               write_appinfo_body<is_array>(s, format_needs_fallback, ctx, b, ix);
+            }
+            append_raw("</xs:annotation>", ctx, b, ix);
+         }
+
+         if (has_restriction) {
+            append_raw("<xs:simpleType><xs:restriction base=\"", ctx, b, ix);
+            write_facet_base_type<Inner>(s, format_has_builtin, ctx, b, ix);
+            append_raw("\">", ctx, b, ix);
+            write_restriction_body(s, format_pattern, ctx, b, ix);
+            append_raw("</xs:restriction></xs:simpleType>", ctx, b, ix);
+         }
+
+         append_raw("</xs:element>", ctx, b, ix);
+      }
+
       template <class ValT, class B>
       void write_xsd_attribute(std::string_view name, is_context auto& ctx, B& b, auto& ix)
       {
@@ -227,6 +686,32 @@ namespace glz::xml
          }
       }
 
+      // Entry point from write_xsd_complex_type_body: dispatches to the
+      // faceted renderer above for a member with a glz::schema entry, or to
+      // the ordinary write_xsd_element otherwise. A faceted variant member
+      // falls back to the ordinary <xs:choice> rendering -- no facet in the
+      // table has a meaning per-alternative of a choice.
+      template <class T, size_t I, class B>
+      void write_xsd_member_element(is_context auto& ctx, B& b, auto& ix)
+      {
+         static constexpr auto key = reflect<T>::keys[I];
+         if constexpr (has_member_schema<T, I>()) {
+            using ValT = field_t<T, I>;
+            using D = std::remove_cvref_t<ValT>;
+            const schema s = get_member_schema<T, I>();
+            if constexpr (is_variant<D>) {
+               write_xsd_variant_element<D>(key, ctx, b, ix);
+            }
+            else {
+               write_xsd_faceted_scalar_element<D>(key, s, ctx, b, ix);
+            }
+         }
+         else {
+            using ValT = field_t<T, I>;
+            write_xsd_element<ValT>(key, ctx, b, ix);
+         }
+      }
+
       // Emits the body of a <xs:complexType> for a reflected object T (the
       // part between the opening tag -- named or anonymous -- and its
       // closing tag), partitioning members by key sigil exactly as the XML
@@ -262,8 +747,7 @@ namespace glz::xml
             for_each<N>([&]<size_t I>() {
                static constexpr auto key = reflect<T>::keys[I];
                if constexpr (!xml::is_attribute_key(key) && !xml::is_text_key(key)) {
-                  using ValT = field_t<T, I>;
-                  write_xsd_element<ValT>(key, ctx, b, ix);
+                  write_xsd_member_element<T, I>(ctx, b, ix);
                }
             });
 

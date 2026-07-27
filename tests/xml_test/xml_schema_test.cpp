@@ -7,6 +7,7 @@
 #include <variant>
 #include <vector>
 
+#include "glaze/json/schema.hpp"
 #include "glaze/xml.hpp"
 #include "ut/ut.hpp"
 
@@ -270,6 +271,92 @@ suite xsd_composite = [] {
          const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
          expect(!ec) << glz::format_error(ec, xsd);
       }
+   };
+};
+
+struct sch_faceted
+{
+   int count{};
+   std::string code{};
+   double ratio{};
+   std::string when{};
+};
+
+template <>
+struct glz::meta<sch_faceted>
+{
+   using T = sch_faceted;
+   static constexpr auto value = object("count", &T::count, "code", &T::code, "ratio", &T::ratio, "when", &T::when);
+   static constexpr std::string_view root_name = "faceted";
+};
+
+// The SAME specialization feeds both the JSON Schema and the XSD generator.
+template <>
+struct glz::json_schema<sch_faceted>
+{
+   schema count{.description = "how many", .minimum = 1L, .maximum = 100L};
+   schema code{.description = "an identifier", .minLength = 2, .maxLength = 8, .pattern = "[a-z]+"};
+   schema ratio{.exclusiveMinimum = 0.0, .exclusiveMaximum = 1.0, .multipleOf = 0.25};
+   schema when{.format = glz::detail::defined_formats::datetime};
+};
+
+suite xsd_facets = [] {
+   "description_becomes_documentation"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      expect(has(xsd, "<xs:annotation>")) << xsd;
+      expect(has(xsd, "<xs:documentation>how many</xs:documentation>")) << xsd;
+      expect(has(xsd, "<xs:documentation>an identifier</xs:documentation>")) << xsd;
+   };
+
+   "numeric_bounds_become_facets"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      expect(has(xsd, R"(<xs:minInclusive value="1"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:maxInclusive value="100"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:minExclusive value="0"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:maxExclusive value="1"/>)")) << xsd;
+   };
+
+   "string_facets"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      expect(has(xsd, R"(<xs:minLength value="2"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:maxLength value="8"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:pattern value="[a-z]+"/>)")) << xsd;
+   };
+
+   "format_maps_to_a_builtin_type"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      expect(has(xsd, R"(name="when" type="xs:dateTime")")) << xsd;
+   };
+
+   "facets_with_no_xsd_equivalent_are_preserved_not_dropped"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      // XSD has no multipleOf facet, so it must survive in appinfo.
+      expect(has(xsd, "<xs:appinfo>")) << xsd;
+      expect(has(xsd, "multipleOf")) << xsd;
+      expect(has(xsd, "0.25")) << xsd;
+   };
+
+   "a_faceted_member_uses_an_inline_simpletype"_test = [] {
+      // A facet-bearing member cannot use a bare built-in type attribute; it
+      // needs an inline restriction.
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      expect(has(xsd, R"(<xs:restriction base="xs:int">)")) << xsd;
+      expect(has(xsd, R"(<xs:restriction base="xs:string">)")) << xsd;
+   };
+
+   "faceted_schema_is_still_parseable"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_faceted>().value_or("<error>");
+      glz::generic g{};
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
+      expect(!ec) << glz::format_error(ec, xsd);
+   };
+
+   "json_schema_generation_is_unaffected"_test = [] {
+      // The shared glz::json_schema specialization must still drive JSON Schema
+      // exactly as before.
+      const auto js = glz::write_json_schema<sch_faceted>().value_or("");
+      expect(has(js, "how many")) << js;
+      expect(has(js, "multipleOf")) << js;
    };
 };
 
