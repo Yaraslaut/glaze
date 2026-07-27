@@ -168,4 +168,109 @@ suite xsd_basics = [] {
    };
 };
 
+enum struct sch_color { red, green, blue };
+
+template <>
+struct glz::meta<sch_color>
+{
+   static constexpr auto value = enumerate(sch_color::red, sch_color::green, sch_color::blue);
+   static constexpr std::string_view name = "sch_color";
+};
+
+struct sch_outer
+{
+   sch_book book{};
+   sch_color color{};
+};
+
+template <>
+struct glz::meta<sch_outer>
+{
+   using T = sch_outer;
+   static constexpr auto value = object("book", &T::book, "color", &T::color);
+   static constexpr std::string_view root_name = "outer";
+};
+
+struct sch_variant
+{
+   std::variant<int, std::string> v{};
+};
+
+template <>
+struct glz::meta<sch_variant>
+{
+   using T = sch_variant;
+   static constexpr auto value = object("v", &T::v);
+};
+
+// Recursive type: the generator must terminate by emitting a named type and
+// referring to it, rather than inlining forever.
+struct sch_node
+{
+   std::string name{};
+   std::vector<sch_node> child{};
+};
+
+template <>
+struct glz::meta<sch_node>
+{
+   using T = sch_node;
+   static constexpr auto value = object("name", &T::name, "child", &T::child);
+   static constexpr std::string_view root_name = "node";
+};
+
+suite xsd_composite = [] {
+   "nested_struct_becomes_a_named_complextype"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_outer>().value_or("<error>");
+      // The nested type is defined once at top level...
+      expect(has(xsd, R"(<xs:complexType name="sch_book">)")) << xsd;
+      // ...and referenced by the member.
+      expect(has(xsd, R"(<xs:element name="book" type="sch_book")")) << xsd;
+   };
+
+   "enum_becomes_a_restriction"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_outer>().value_or("<error>");
+      expect(has(xsd, R"(<xs:simpleType name="sch_color">)")) << xsd;
+      expect(has(xsd, R"(<xs:restriction base="xs:string">)")) << xsd;
+      expect(has(xsd, R"(<xs:enumeration value="red"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:enumeration value="green"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:enumeration value="blue"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:element name="color" type="sch_color")")) << xsd;
+   };
+
+   "variant_becomes_a_choice"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_variant>().value_or("<error>");
+      expect(has(xsd, "<xs:choice>")) << xsd;
+      expect(has(xsd, R"(type="xs:int")")) << xsd;
+      expect(has(xsd, R"(type="xs:string")")) << xsd;
+   };
+
+   "recursive_type_terminates"_test = [] {
+      // If this hangs or blows the stack, the named-type indirection is missing.
+      const auto xsd = glz::write_xml_schema<sch_node>().value_or("<error>");
+      expect(has(xsd, R"(<xs:complexType name="sch_node">)")) << xsd;
+      expect(has(xsd, R"(<xs:element name="child" type="sch_node")")) << xsd;
+      expect(has(xsd, R"(maxOccurs="unbounded")")) << xsd;
+   };
+
+   "each_named_type_is_defined_exactly_once"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_outer>().value_or("<error>");
+      size_t count = 0;
+      for (size_t pos = 0; (pos = xsd.find(R"(<xs:complexType name="sch_book">)", pos)) != std::string::npos; ++pos) {
+         ++count;
+      }
+      expect(count == size_t(1)) << "duplicate type definitions make the schema invalid: " << xsd;
+   };
+
+   "composite_schema_is_still_parseable"_test = [] {
+      for (const auto& xsd : {glz::write_xml_schema<sch_outer>().value_or("<error>"),
+                              glz::write_xml_schema<sch_variant>().value_or("<error>"),
+                              glz::write_xml_schema<sch_node>().value_or("<error>")}) {
+         glz::generic g{};
+         const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
+         expect(!ec) << glz::format_error(ec, xsd);
+      }
+   };
+};
+
 int main() {}
