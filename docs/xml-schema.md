@@ -27,17 +27,19 @@ struct glz::meta<book>
 int main()
 {
    auto schema = glz::write_xml_schema<book>().value();
-   // schema contains:
-   //   <?xml version="1.0" encoding="UTF-8"?>
-   //   <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
-   //   <xs:complexType name="book">
-   //     <xs:sequence>
-   //       <xs:element name="title" type="xs:string"/>
-   //       <xs:element name="year" type="xs:int"/>
-   //     </xs:sequence>
-   //   </xs:complexType>
-   //   <xs:element name="book" type="book"/>
-   //   </xs:schema>
+   // schema ==
+   //   "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+   //   "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n"
+   //   "<xs:complexType name=\"book\"><xs:sequence>"
+   //   "<xs:element name=\"title\" type=\"xs:string\"/>"
+   //   "<xs:element name=\"year\" type=\"xs:int\"/>"
+   //   "</xs:sequence></xs:complexType>\n"
+   //   "  <xs:element name=\"book\" type=\"book\"/>\n"
+   //   "</xs:schema>"
+   //
+   // There is no prettify option for schema generation: each complexType/simpleType body is emitted as a single
+   // unindented line regardless of how deeply the C++ type is nested. This differs from write_xml, whose `prettify`
+   // option indents element bodies -- that option has no XSD-generation equivalent.
 }
 ```
 
@@ -46,8 +48,14 @@ returns `glz::error_ctx` directly, matching every other Glaze writer.
 
 Every distinct struct and enum type reachable from `T` — including `T` itself — is emitted exactly once as a
 top-level named `xs:complexType` or `xs:simpleType` and referenced by name elsewhere, so a self-referential type
-(a struct holding a `std::vector` of itself) terminates rather than inlining forever. The document's single root
-`xs:element` is named using the same [root name resolution](xml.md#root-element-naming) as `write_xml`.
+(a struct holding a `std::vector` of itself) terminates rather than inlining forever.
+
+The document's single root `xs:element` is named using **only the first two** of `write_xml`'s three root-name
+resolution steps: `glz::meta<T>::root_name`, if declared, else the literal fallback `"root"`. `write_xml`'s third
+step — a runtime `root_name` argument — has no equivalent here, because `write_xml_schema<T>()` takes no such
+argument at all; the name it resolves is necessarily a compile-time property of `T`, since the schema is generated
+without a value to write. If you pass a custom runtime root name to `write_xml`, the generated schema's root element
+name will not match it unless you also declare `glz::meta<T>::root_name`.
 
 ## C++ → XSD Type Mapping
 
@@ -63,11 +71,21 @@ top-level named `xs:complexType` or `xs:simpleType` and referenced by name elsew
 | `std::vector<T>`, sequences | `maxOccurs="unbounded"` |
 | `std::variant<...>` | `xs:choice` |
 | nested struct | named `xs:complexType` |
-| `#text` member | `xs:simpleContent` / `xs:extension` |
-| chrono types | `xs:dateTime`, `xs:duration` |
+| `#text` member, no element members | `xs:simpleContent` / `xs:extension` |
+| `#text` member alongside element members | `mixed="true"` on the enclosing `xs:complexType` |
+| `std::map<K, V>` | `xs:any` wildcard (runtime keys can't be enumerated in a schema) |
+| chrono types | `xs:string` (no chrono-aware XSD type is emitted; see note below) |
 
-A member key prefixed with `@` becomes an `xs:attribute` rather than a sequence particle, and a `#text` member
-switches the whole enclosing type to `xs:simpleContent`, mirroring `write_xml`'s own mapping exactly:
+`xsd_type_of` has no case for `std::chrono` types — a chrono member falls through to the generic scalar default and
+is typed `xs:string`, not `xs:dateTime` or `xs:duration`. There is currently no chrono-aware branch in the type
+mapping to produce those.
+
+A member key prefixed with `@` becomes an `xs:attribute` rather than a sequence particle. A `#text` member's effect
+on the enclosing type depends on whether the type also has element (non-attribute) members: with none, the type
+becomes `xs:simpleContent` / `xs:extension`, since XSD's `simpleContent` cannot carry child elements; with at least
+one, the type is instead a `mixed="true"` `xs:complexType`, letting text and elements coexist. Both forms — plus the
+`std::map` → `xs:any` mapping above — were verified with `xmllint --schema` against documents `write_xml` actually
+produces, so the schema validates `write_xml`'s real output for these shapes:
 
 ```c++
 #include "glaze/xml.hpp"
@@ -223,13 +241,21 @@ form for it to apply to — so it is intentionally left out rather than shipped 
 | `minLength`, `maxLength` | `xs:minLength`, `xs:maxLength` | exact |
 | `enumeration` | `xs:enumeration` | exact |
 | `minItems`, `maxItems` | `minOccurs`, `maxOccurs` | exact |
-| `defaultValue` | `default` attribute | exact |
+| `defaultValue` | `default` attribute | conditional — see below |
 | `format` | `xs:dateTime`, `xs:date`, `xs:time`, `xs:duration`, `xs:anyURI` | partial |
 | `pattern` | `xs:pattern` | dialect caveat |
 | `multipleOf`, `uniqueItems`, `constant`, `readOnly`, `writeOnly`, `minProperties`, `maxProperties`, `minContains`, `maxContains` | `xs:appinfo` | preserved, not enforced |
 
-Two mappings above carry caveats worth stating plainly:
+Three mappings above carry caveats worth stating plainly:
 
+- **`defaultValue` is dropped whenever the member also has a restriction facet, or is an array.** XSD's `default`
+  attribute lives on the `xs:element` tag itself, but once any restriction facet (`minimum`, `maximum`, `minLength`,
+  `enumeration`, `pattern`, an XSD-lacking `format`, and so on) is present, the generator instead emits a nested
+  anonymous `xs:simpleType`/`xs:restriction`, which has no attribute position left for `default` to attach to — so it
+  is simply not written. The same omission applies to array members (`minOccurs`/`maxOccurs` are written instead of
+  `type`, and again there is no attribute slot for `default`). A `defaultValue` on a plain, unrestricted, non-array
+  member is written faithfully; on anything else, register the facet but do not expect the generated schema to carry
+  the default.
 - **`pattern` is passed through verbatim.** XSD's regular-expression dialect (`xs:pattern`) is **not** the same
   dialect as JSON Schema's ECMA-262 regex: XSD patterns are implicitly anchored (no `^`/`$` needed, and it is not a
   substring search), and several escape sequences differ between the two. A pattern authored for JSON Schema is not

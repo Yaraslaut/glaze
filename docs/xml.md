@@ -50,7 +50,7 @@ objects become truthy when an error occurred; pass one to `glz::format_error` fo
 
 ## The Mapping Table
 
-One rule set applies identically to reflected structs and `glz::generic`. Member keys partition by sigil:
+This rule set applies to reflected structs. Member keys partition by sigil:
 
 | XML construct | Key | C++ |
 |---|---|---|
@@ -65,6 +65,10 @@ One rule set applies identically to reflected structs and `glz::generic`. Member
 
 Attribute and text values are strings on the wire but coerce to the member's declared type (`int id` reads
 `id="7"`). Comments and processing instructions are skipped when reading and are never emitted when writing.
+
+`glz::generic` follows the same table for an element carrying attributes and/or children, but **not** for a leaf
+element with neither: that case collapses to a bare string instead of `{"#text": "..."}`. See
+[Limitations](#limitations) below.
 
 ## Attributes and Text
 
@@ -140,7 +144,8 @@ int main()
 
 Reading into a struct is always unambiguous because the member's declared type decides: a `std::vector<T>` member
 collects every occurrence — even exactly one — while a scalar member that receives a second occurrence of its key is
-an error (`glz::error_code::duplicate_key`) unless `error_on_unknown_keys` is disabled. This is different from the
+always an error (`glz::error_code::duplicate_key`), regardless of `error_on_unknown_keys` — that option only governs
+keys with *no* matching member, not a second occurrence of one that already matched. This is different from the
 `glz::generic` path; see [Limitations](#limitations) below.
 
 ## Root Element Naming
@@ -187,7 +192,9 @@ wire is never checked against `root_name`.
 
 ## Options
 
-`glz::xml::xml_opts` extends the format-agnostic `glz::opts` with XML-specific controls:
+`glz::xml::xml_opts` is a standalone struct — it does **not** inherit from or extend `glz::opts`. It duplicates the
+handful of format-agnostic fields XML needs (`format`, `error_on_unknown_keys`, `error_on_missing_keys`,
+`skip_null_members`) as members of its own, alongside the XML-specific controls:
 
 | Option | Default | Description |
 |---|---|---|
@@ -277,6 +284,31 @@ int main()
 This is a limitation of the untyped path only. Reading into a struct is always unambiguous: a `std::vector<T>`
 member collects every occurrence, even a single one (see [Repeated Elements](#repeated-elements) above).
 
+### A `glz::generic` leaf collapses to a bare string
+
+A second, independent untyped-path divergence: an element with no attributes and no child elements — only text, or
+nothing at all — does not read into `glz::generic` as `{"#text": "..."}`. It collapses to a bare string holding that
+text verbatim, so `"#text"` does not exist as a key on it:
+
+```c++
+#include "glaze/json/generic.hpp"
+#include "glaze/xml.hpp"
+
+int main()
+{
+   glz::generic g{};
+   [[maybe_unused]] const auto ec = glz::read_xml(g, std::string{"<r><title>Dune</title></r>"});
+   // g["title"].is_string() == true -- not an object, so g["title"]["#text"] does not exist
+   // g["title"].get<std::string>() == "Dune"
+}
+```
+
+This is why the earlier `xml_user` example above reads `g["#text"]` successfully: that element also carries
+attributes (`@id`, `@role`), which keeps it an object with a `"#text"` member. A pure-text leaf with no attributes
+and no children takes the shortcut instead. As with the count heuristic above, this is a limitation of the untyped
+path only — a struct member declared as `#text` always binds to element text regardless of whether the element also
+carries attributes.
+
 ### Nested containers are not supported
 
 The repeated-sibling convention takes an element name from the *enclosing struct member's key*. A sequence nested
@@ -353,6 +385,74 @@ A bare top-level sequence (`glz::write_xml(std::vector<T>{...})`) is rejected fo
 would repeat its wrapper tag once per item at the document root, producing multiple root elements, which is not
 well-formed XML.
 
+### Reading does not preserve `xmlns` declarations
+
+Reading a namespaced document does not preserve its `xmlns` / `xmlns:*` declarations, so a read→write round trip of
+a namespaced document produces XML that is **not well-formed with respect to namespaces**. Element and attribute
+*names* keep their prefixes on read (`"p:c"` stays `"p:c"`), but the declaration that bound `p` to a URI is discarded
+— it is treated as namespace metadata, not data, and never surfaces as an `"@xmlns:p"` member or generic key.
+
+For a typed struct, a declared `"@xmlns:p"` member writes correctly but never reads back — the member is silently
+left at its default value:
+
+```c++
+#include "glaze/xml.hpp"
+
+struct ns_doc
+{
+   std::string ns{};
+   std::string c{};
+};
+
+template <>
+struct glz::meta<ns_doc>
+{
+   using T = ns_doc;
+   static constexpr auto value = object("@xmlns:p", &T::ns, "p:c", &T::c);
+   static constexpr std::string_view root_name = "r";
+};
+
+int main()
+{
+   const ns_doc d{.ns = "urn:p", .c = "hi"};
+   const auto xml = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(d).value_or("<error>");
+   // xml == "<r xmlns:p=\"urn:p\"><p:c>hi</p:c></r>" -- correct
+
+   ns_doc parsed{};
+   const auto ec = glz::read_xml(parsed, xml);
+   // ec == 0, but parsed.ns == "" -- the xmlns:p declaration is silently lost, parsed.c == "hi"
+}
+```
+
+For `glz::generic`, the round trip is worse than silent data loss: it produces a document Glaze's own reader
+rejects. Re-emitting `p:c` without its now-forgotten `xmlns:p` declaration is not well-formed with respect to
+namespaces — `xmllint` reports "Namespace prefix p on c is not defined", and re-reading Glaze's own output fails with
+`glz::error_code::syntax_error`:
+
+```c++
+#include "glaze/json/generic.hpp"
+#include "glaze/xml.hpp"
+
+int main()
+{
+   glz::generic g{};
+   const auto ec1 = glz::read_xml(g, std::string{R"(<r xmlns:p="urn:p"><p:c>hi</p:c></r>)"});
+   // ec1 == 0
+
+   const auto xml = glz::write_xml<glz::xml::xml_opts{.write_declaration = false}>(g, "r").value_or("<error>");
+   // xml == "<r><p:c>hi</p:c></r>" -- xmlns:p was never recovered, so it cannot be re-emitted
+
+   glz::generic g2{};
+   const auto ec2 = glz::read_xml(g2, xml);
+   // ec2 != 0 -- glz::error_code::syntax_error: "p" is used but never declared
+}
+```
+
+Namespaced documents are therefore effectively **read-only** for round-tripping: Glaze can read one and consult its
+values, but cannot faithfully write it back out. A caller who needs to re-emit a namespaced document must supply the
+`xmlns:*` declarations itself, via an `@xmlns:*` member on the writing side (as `ns_doc` does above) — Glaze will not
+reconstruct them from the prefixes alone.
+
 ## Conformance
 
 Glaze implements XML 1.0 (5th edition) **well-formedness** plus
@@ -385,5 +485,11 @@ Glaze implements XML 1.0 (5th edition) **well-formedness** plus
 4. **UTF-8 only.** A document that declares a non-UTF-8 encoding is rejected outright rather than silently misread.
 
 Reading is intentionally permissive about document shape: any root element name is accepted, and unknown keys can
-be tolerated with `error_on_unknown_keys = false`. Writing is intentionally strict about names: a key that is not a
-valid XML `Name` is always rejected rather than ever emitting a document Glaze's own reader would reject.
+be tolerated with `error_on_unknown_keys = false`. Writing rejects a key that is not a valid XML `Name` outright, but
+this does **not** mean Glaze never emits a document its own reader would reject: namespace declarations are the
+counterexample. `write_xml` happily emits `xmlns:p="urn:p"` for a declared `@xmlns:p` member, and its element/attribute
+*names* are validated as ordinary `Name`s — the `p:c` prefix is a perfectly valid `Name` all by itself, independent of
+whether `p` is bound. So a name-validity check alone cannot catch this: the two-round-trip case in [Reading does not
+preserve `xmlns` declarations](#reading-does-not-preserve-xmlns-declarations) shows Glaze re-emitting `p:c` with no
+`xmlns:p` declaration in scope at all — well-formed by the `Name` production, but not well-formed with respect to
+namespaces, and rejected by Glaze's own reader on re-read.

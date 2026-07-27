@@ -15,12 +15,14 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
