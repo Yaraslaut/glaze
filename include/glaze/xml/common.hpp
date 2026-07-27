@@ -655,7 +655,11 @@ namespace glz::xml
       }
 
       const std::string_view target{target_begin, size_t(p - target_begin)};
-      if (!validate_name(target)) {
+      // PITarget must additionally be an NCName -- Namespaces in XML 1.0
+      // reserves ':' for prefix/local-name separation, so e.g. "<?p:i ?>"
+      // is not well-formed even though "p:i" is a valid (unqualified) [5]
+      // Name in the base XML grammar.
+      if (!validate_ncname(target)) {
          ctx.error = error_code::syntax_error;
          return false;
       }
@@ -758,15 +762,35 @@ namespace glz::xml
       if (!parse_eq()) return false;
       std::string_view version;
       if (!parse_quoted(version)) return false;
-      if (version != "1.0" && version != "1.1") {
+      // VersionNum ::= '1.' [0-9]+ (XML 1.0 5th ed.) -- so e.g. "1.9" is
+      // well-formed even though this parser only implements 1.0 semantics
+      // (a document declaring "1.1" is accepted here but handled elsewhere as
+      // "recognised, unsupported features" rather than rejected outright).
+      const auto is_digit = [](char c) noexcept { return c >= '0' && c <= '9'; };
+      const bool valid_version = version.size() > 2 && version[0] == '1' && version[1] == '.' &&
+                                 std::all_of(version.begin() + 2, version.end(), is_digit);
+      if (!valid_version) {
          ctx.error = error_code::syntax_error;
          return false;
       }
+
+      // Each pseudo-attribute after the first (mandatory) one must be
+      // preceded by whitespace -- EncodingDecl and SDDecl both begin with S
+      // in the grammar, so '<?xml version="1.0"encoding="UTF-8"?>' is not
+      // well-formed even though both pseudo-attributes are individually
+      // valid. Mirrors the same rule already enforced between attributes in
+      // parse_start_tag.
+      const char* before_ws = p;
       skip_whitespace(p, end);
+      bool had_whitespace = p != before_ws;
 
       // EncodingDecl -- optional. EncName ::= [A-Za-z] ([A-Za-z0-9._] | '-')*
       constexpr std::string_view encoding_lit = "encoding";
       if (starts_with(encoding_lit)) {
+         if (!had_whitespace) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
          p += encoding_lit.size();
          if (!parse_eq()) return false;
          std::string_view encoding;
@@ -785,12 +809,42 @@ namespace glz::xml
                return false;
             }
          }
+
+         // This parser only ever reads input as UTF-8. A document that
+         // declares any other encoding is misinterpreted rather than
+         // rejected if we press on -- e.g. Shift_JIS bytes decoded as UTF-8
+         // silently produce garbage instead of an error. US-ASCII is a
+         // strict subset of UTF-8 (every valid US-ASCII byte sequence is
+         // also valid, identical UTF-8), so it is accepted too.
+         const auto ieq = [](std::string_view a, std::string_view b) noexcept {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+               char ca = a[i];
+               char cb = b[i];
+               if (ca >= 'A' && ca <= 'Z') ca = char(ca - 'A' + 'a');
+               if (cb >= 'A' && cb <= 'Z') cb = char(cb - 'A' + 'a');
+               if (ca != cb) return false;
+            }
+            return true;
+         };
+         if (!ieq(encoding, "utf-8") && !ieq(encoding, "us-ascii")) {
+            ctx.error = error_code::feature_not_supported;
+            ctx.custom_error_message = encoding;
+            return false;
+         }
+
+         before_ws = p;
          skip_whitespace(p, end);
+         had_whitespace = p != before_ws;
       }
 
       // SDDecl -- optional, must follow EncodingDecl (if present).
       constexpr std::string_view standalone_lit = "standalone";
       if (starts_with(standalone_lit)) {
+         if (!had_whitespace) {
+            ctx.error = error_code::syntax_error;
+            return false;
+         }
          p += standalone_lit.size();
          if (!parse_eq()) return false;
          std::string_view standalone;
@@ -1207,9 +1261,24 @@ namespace glz::xml
       // in scope for the whole tag, not just what follows them textually.
       // Each such attribute is marked is_namespace_decl so it is never
       // offered to the member binder as ordinary data.
+      // Namespaces in XML 1.0 section 4, "Reserved Prefixes and Namespace
+      // Names": both reserved namespace names are pinned to a single prefix
+      // each, in both directions -- the prefix may only be bound to its own
+      // URI, AND that URI may only ever be bound to its own prefix (the xml
+      // one may also simply go undeclared, since it is implicitly bound).
+      // The xmlns URI additionally may never be declared at all, including
+      // as the default namespace, since the xmlns prefix itself -- the only
+      // prefix permitted to carry it -- can never be declared to begin with.
+      constexpr std::string_view xml_ns_uri = "http://www.w3.org/XML/1998/namespace";
+      constexpr std::string_view xmlns_ns_uri = "http://www.w3.org/2000/xmlns/";
+
       for (auto& attr : out.attributes) {
          if (attr.name == "xmlns") {
             attr.is_namespace_decl = true;
+            if (attr.value == xmlns_ns_uri || attr.value == xml_ns_uri) {
+               ctx.error = error_code::syntax_error; // neither reserved URI may be the default namespace
+               return false;
+            }
             ctx.bind_prefix("", attr.value); // default namespace
             continue;
          }
@@ -1224,8 +1293,16 @@ namespace glz::xml
                ctx.error = error_code::syntax_error; // the 'xmlns' prefix may never be bound
                return false;
             }
-            if (prefix == "xml" && attr.value != "http://www.w3.org/XML/1998/namespace") {
+            if (attr.value == xmlns_ns_uri) {
+               ctx.error = error_code::syntax_error; // only the (undeclarable) 'xmlns' prefix may carry this URI
+               return false;
+            }
+            if (prefix == "xml" && attr.value != xml_ns_uri) {
                ctx.error = error_code::syntax_error; // rebinding 'xml' to another URI is forbidden
+               return false;
+            }
+            if (prefix != "xml" && attr.value == xml_ns_uri) {
+               ctx.error = error_code::syntax_error; // only the 'xml' prefix may carry this URI
                return false;
             }
             ctx.bind_prefix(prefix, attr.value);
@@ -1264,6 +1341,42 @@ namespace glz::xml
          if (!check_qname(attr.name)) {
             ctx.error = error_code::syntax_error;
             return false;
+         }
+      }
+
+      // Namespaces in XML 1.0: two attributes are also duplicates if, once
+      // their prefixes are resolved, they share the same (namespace URI,
+      // local name) pair -- even though their raw qualified names (and thus
+      // their prefixes) differ, e.g. xmlns:a and xmlns:b both bound to
+      // "urn:1" with attributes a:n and b:n. The raw-name check above the
+      // attribute-collection loop only catches identical spellings, so this
+      // is a separate pass. Unprefixed attributes are excluded: per the
+      // Namespaces spec an attribute with no prefix is in no namespace at
+      // all (the default namespace applies only to elements), so it can
+      // only collide, by raw name, with another unprefixed attribute --
+      // already handled above.
+      for (size_t i = 0; i < out.attributes.size(); ++i) {
+         const auto& a = out.attributes[i];
+         if (a.is_namespace_decl) continue;
+         const auto colon_a = a.name.find(':');
+         if (colon_a == std::string::npos) continue;
+         const std::string_view prefix_a{a.name.data(), colon_a};
+         const std::string_view local_a{a.name.data() + colon_a + 1, a.name.size() - colon_a - 1};
+         const std::string_view uri_a = prefix_a == "xml" ? xml_ns_uri : ctx.resolve_prefix(prefix_a);
+
+         for (size_t j = i + 1; j < out.attributes.size(); ++j) {
+            const auto& b = out.attributes[j];
+            if (b.is_namespace_decl) continue;
+            const auto colon_b = b.name.find(':');
+            if (colon_b == std::string::npos) continue;
+            const std::string_view local_b{b.name.data() + colon_b + 1, b.name.size() - colon_b - 1};
+            if (local_a != local_b) continue;
+            const std::string_view prefix_b{b.name.data(), colon_b};
+            const std::string_view uri_b = prefix_b == "xml" ? xml_ns_uri : ctx.resolve_prefix(prefix_b);
+            if (uri_a == uri_b) {
+               ctx.error = error_code::duplicate_key;
+               return false;
+            }
          }
       }
 

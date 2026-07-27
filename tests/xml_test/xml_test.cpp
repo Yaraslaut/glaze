@@ -2138,4 +2138,58 @@ suite illegal_chars_rejected_everywhere = [] {
    };
 };
 
+suite conformance_gap_fixes = [] {
+   auto rejects = [](std::string_view d) {
+      glz::generic g{};
+      return bool(glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, std::string{d}));
+   };
+   auto accepts = [](std::string_view d) {
+      glz::generic g{};
+      return !glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, std::string{d});
+   };
+
+   "xmldecl_requires_whitespace_between_pseudo_attributes"_test = [rejects, accepts] {
+      expect(rejects(R"(<?xml version="1.0"encoding="UTF-8"?><a/>)"));
+      expect(rejects(R"(<?xml version="1.0" encoding="UTF-8"standalone="yes"?><a/>)"));
+      expect(accepts(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?><a/>)"));
+      expect(accepts("<?xml version=\"1.0\"\n   encoding=\"UTF-8\"?><a/>"));
+   };
+
+   "version_accepts_any_1_x"_test = [rejects, accepts] {
+      expect(accepts(R"(<?xml version="1.0"?><a/>)"));
+      expect(accepts(R"(<?xml version="1.9"?><a/>)")) << "VersionNum is '1.' [0-9]+";
+      expect(accepts(R"(<?xml version="1.10"?><a/>)"));
+      expect(rejects(R"(<?xml version="2.0"?><a/>)"));
+      expect(rejects(R"(<?xml version="1"?><a/>)"));
+      expect(rejects(R"(<?xml version="1."?><a/>)"));
+   };
+
+   "namespace_reserved_uris"_test = [rejects, accepts] {
+      expect(accepts(R"(<a xmlns:xml="http://www.w3.org/XML/1998/namespace"/>)")) << "xml may be bound to its own URI";
+      expect(rejects(R"(<a xmlns:p="http://www.w3.org/XML/1998/namespace"/>)"))
+         << "only the xml prefix may be bound to the xml namespace URI";
+      expect(rejects(R"(<a xmlns:p="http://www.w3.org/2000/xmlns/"/>)")) << "the xmlns namespace URI may not be bound";
+   };
+
+   "duplicate_attributes_after_namespace_resolution"_test = [rejects] {
+      expect(rejects(R"(<x xmlns:a="urn:1" xmlns:b="urn:1" a:n="1" b:n="2"/>)"))
+         << "same URI + same local name is a duplicate even with different prefixes";
+   };
+
+   "pi_target_may_not_contain_a_colon"_test = [rejects, accepts] {
+      expect(rejects(R"(<a><?p:i data?></a>)"));
+      expect(accepts(R"(<a><?pi data?></a>)"));
+   };
+
+   "declared_encoding_must_be_utf8"_test = [rejects, accepts] {
+      expect(accepts(R"(<?xml version="1.0"?><a/>)")) << "no encoding declared is fine";
+      expect(accepts(R"(<?xml version="1.0" encoding="UTF-8"?><a/>)"));
+      expect(accepts(R"(<?xml version="1.0" encoding="utf-8"?><a/>)"));
+      expect(accepts(R"(<?xml version="1.0" encoding="US-ASCII"?><a/>)")) << "strict UTF-8 subset";
+      expect(rejects(R"(<?xml version="1.0" encoding="Shift_JIS"?><a/>)"))
+         << "we are UTF-8 only; misreading is worse than refusing";
+      expect(rejects(R"(<?xml version="1.0" encoding="ISO-8859-1"?><a/>)"));
+   };
+};
+
 int main() {}
