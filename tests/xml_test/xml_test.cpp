@@ -2032,4 +2032,76 @@ suite namespaces_and_dtd = [] {
    };
 };
 
+struct ns_alt_a
+{
+   std::string other{};
+};
+
+template <>
+struct glz::meta<ns_alt_a>
+{
+   using T = ns_alt_a;
+   static constexpr auto value = object("@other", &T::other);
+};
+
+struct ns_alt_b
+{
+   std::string bogus{};
+};
+
+template <>
+struct glz::meta<ns_alt_b>
+{
+   using T = ns_alt_b;
+   static constexpr auto value = object("@bogus", &T::bogus);
+};
+
+struct ns_variant_doc
+{
+   std::variant<ns_alt_a, ns_alt_b> v{};
+   std::string tail{};
+};
+
+template <>
+struct glz::meta<ns_variant_doc>
+{
+   using T = ns_variant_doc;
+   static constexpr auto value = object("v", &T::v, "q:tail", &T::tail);
+};
+
+suite namespace_scope_rollback = [] {
+   "failed_variant_alternative_does_not_leak_a_prefix"_test = [] {
+      // The variant retry resets ctx.error and ctx.element_stack and keeps
+      // parsing on the same context. Without also rolling back the namespace
+      // stacks, a prefix declared inside the failed alternative stayed bound
+      // for the rest of the document, so an out-of-scope prefix resolved and
+      // an invalid document was silently accepted.
+      ns_variant_doc d{};
+      const std::string xml = R"(<Doc><v xmlns:q="urn:q" bogus="1"></v><q:tail>hi</q:tail></Doc>)";
+      const auto ec = glz::read_xml(d, xml);
+      expect(bool(ec)) << "q is out of scope on <q:tail> and must not resolve";
+   };
+
+   "prefix_still_resolves_inside_its_own_scope"_test = [] {
+      // Regression guard: the rollback must not over-truncate.
+      glz::generic g{};
+      const std::string xml = R"(<r xmlns:p="urn:p"><p:x>1</p:x></r>)";
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+   };
+
+   "second_doctype_is_rejected"_test = [] {
+      // prolog ::= XMLDecl? Misc* (doctypedecl Misc*)? -- at most one DOCTYPE.
+      glz::generic g{};
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(
+         g, std::string{"<!DOCTYPE a><!DOCTYPE b><a/>"});
+      expect(bool(ec)) << "a second DOCTYPE must be rejected";
+
+      glz::generic g2{};
+      const auto ec2 =
+         glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g2, std::string{"<!DOCTYPE a><a/>"});
+      expect(!ec2) << "one DOCTYPE is still fine";
+   };
+};
+
 int main() {}

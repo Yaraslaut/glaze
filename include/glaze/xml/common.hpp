@@ -954,6 +954,7 @@ namespace glz::xml
          }
       }
 
+      bool seen_doctype = false;
       while (it < end) {
          if (is_whitespace(*it)) {
             skip_whitespace(it, end);
@@ -968,6 +969,14 @@ namespace glz::xml
             continue;
          }
          if (size_t(end - it) >= 9 && std::string_view{it, 9} == "<!DOCTYPE") {
+            // prolog ::= XMLDecl? Misc* (doctypedecl Misc*)? -- at most one
+            // doctypedecl is permitted; without this guard a second
+            // "<!DOCTYPE" here would simply be skipped like the first.
+            if (seen_doctype) {
+               ctx.error = error_code::syntax_error;
+               return false;
+            }
+            seen_doctype = true;
             if (!skip_dtd(it, end, ctx)) return false;
             continue;
          }

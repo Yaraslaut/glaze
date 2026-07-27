@@ -667,6 +667,8 @@ namespace glz
 
          const auto start = it;
          const auto stack_depth = ctx.element_stack.size();
+         const auto ns_bindings_depth = ctx.ns_bindings.size();
+         const auto ns_scope_marks_depth = ctx.ns_scope_marks.size();
 
          auto try_parse = [&]<size_t I>() -> bool {
             using Alt = std::variant_alternative_t<I, V>;
@@ -681,6 +683,15 @@ namespace glz
             ctx.error = error_code::none;
             ctx.custom_error_message = {};
             ctx.element_stack.resize(stack_depth);
+            // A failed alternative may have opened namespace scopes (via
+            // parse_start_tag's unconditional push_ns_scope()) and bound
+            // prefixes within them without ever reaching the matching
+            // pop_ns_scope() on its error-exit path. Left in place, such a
+            // prefix would stay resolvable for the rest of the document even
+            // though the element that declared it never actually matched.
+            // Roll both stacks back exactly like element_stack above.
+            ctx.ns_bindings.resize(ns_bindings_depth);
+            ctx.ns_scope_marks.resize(ns_scope_marks_depth);
             return false;
          };
 
