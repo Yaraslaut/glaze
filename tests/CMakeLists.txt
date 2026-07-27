@@ -103,6 +103,7 @@ add_subdirectory(toml_test)
 add_subdirectory(utility_formats)
 add_subdirectory(yaml_test)
 add_subdirectory(xml_test)
+add_subdirectory(xml_conformance)
 
 add_subdirectory(yaml_conformance)
 add_subdirectory(msgpack_test)
