@@ -5535,7 +5535,10 @@ Cover:
 3. Shared annotations via `glz::json_schema<T>`, stating that the one
    specialization feeds both the JSON Schema and XSD generators.
 4. XML-only annotations via `glz::xml_schema<T>` — `xsd_type`, `as_attribute` /
-   `as_element`, `target_namespace`, `namespace_prefix`, `substitution_group`.
+   `as_element`, `target_namespace`, `namespace_prefix`. Note that substitution
+   groups are deliberately not offered — real XSD substitution groups apply only
+   to global element declarations, whereas this generator emits local nested
+   particles, so the option could only ever be a no-op.
 5. The facet mapping table from spec §7.3, **including the two caveats**:
    - `pattern` is passed through verbatim; XSD regex is a different dialect
      from JSON Schema's ECMA-262 (implicitly anchored, different escapes).
