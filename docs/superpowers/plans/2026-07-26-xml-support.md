@@ -5068,7 +5068,6 @@ by construction, so there is no precedence puzzle in the common case.
         std::optional<std::string_view> xsd_type{};  // xs:ID, xs:IDREF, xs:NMTOKEN, ...
         std::optional<bool> as_attribute{};          // force attribute form
         std::optional<bool> as_element{};            // force element form
-        std::optional<std::string_view> substitution_group{};
      };
 
      // Per-type XML-only metadata. Optional; absent for most types.
