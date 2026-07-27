@@ -3620,9 +3620,12 @@ suite xmltest_not_wf = [] {
       // The lowercase form is well-formed.
       expect(accepts(R"(<doc>&#x58;</doc>)"));
    };
-   "not-wf-sa-140: name starts with a combining character"_test = [] {
-      expect(rejects("<doc>\xCC\x80x</doc>"));
-   };
+   // not-wf-sa-140 is deliberately NOT transcribed. The upstream document is
+   //     <!DOCTYPE doc [<!ENTITY e "<&#x309a;></&#x309a;>">]><doc>&e;</doc>
+   // which uses U+309A as an element NAME, and it is marked EDITION="1 2 3 4".
+   // We target XML 1.0 5th edition, which relaxed the name productions so that
+   // character is legal -- xmllint accepts it for the same reason. The Task 17
+   // harness excludes it via the same EDITION filter, so the two agree.
    "not-wf-not-sa-001: XML declaration must be first"_test = [] {
       expect(rejects("\n<?xml version=\"1.0\"?><doc></doc>"));
    };
