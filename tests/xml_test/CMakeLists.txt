@@ -25,3 +25,16 @@ endif ()
 
 add_test(NAME xml_schema_test COMMAND xml_schema_test)
 target_code_coverage(xml_schema_test AUTO ALL)
+
+add_executable(xml_xmllint_test xml_xmllint_test.cpp)
+target_link_libraries(xml_xmllint_test PRIVATE glz_test_common)
+target_compile_definitions(xml_xmllint_test PRIVATE
+    XML_TEST_TMP_DIR="${CMAKE_CURRENT_BINARY_DIR}"
+)
+
+if (MINGW)
+    target_compile_options(xml_xmllint_test PRIVATE "-Wa,-mbig-obj")
+endif ()
+
+add_test(NAME xml_xmllint_test COMMAND xml_xmllint_test)
+target_code_coverage(xml_xmllint_test AUTO ALL)

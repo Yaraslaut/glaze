@@ -28,14 +28,13 @@ namespace glz
 {
    // XML-only schema metadata for a single member: concepts glz::schema cannot
    // express, because they describe the shape of the *document* (attribute vs.
-   // element form, ID/IDREF linkage, substitution groups) rather than value
-   // constraints shared with JSON Schema.
+   // element form, ID/IDREF linkage) rather than value constraints shared with
+   // JSON Schema.
    struct xml_schema_field final
    {
       std::optional<std::string_view> xsd_type{}; // e.g. "xs:ID", "xs:IDREF", "xs:NMTOKEN"
       std::optional<bool> as_attribute{}; // force attribute form, overriding the '@' sigil
       std::optional<bool> as_element{}; // force element form, overriding the '@' sigil
-      std::optional<std::string_view> substitution_group{}; // reserved for a future task; not yet consumed
    };
 
    // Per-type XML-only schema metadata. Optional -- absent for most types.
