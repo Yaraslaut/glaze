@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -22,6 +23,44 @@
 #include "glaze/xml/opts.hpp"
 #include "glaze/xml/read.hpp" // xml::detail::text_member_index
 #include "glaze/xml/write.hpp" // xml::resolve_root_name, xml::detail::xml_reflected_object
+
+namespace glz
+{
+   // XML-only schema metadata for a single member: concepts glz::schema cannot
+   // express, because they describe the shape of the *document* (attribute vs.
+   // element form, ID/IDREF linkage, substitution groups) rather than value
+   // constraints shared with JSON Schema.
+   struct xml_schema_field final
+   {
+      std::optional<std::string_view> xsd_type{}; // e.g. "xs:ID", "xs:IDREF", "xs:NMTOKEN"
+      std::optional<bool> as_attribute{}; // force attribute form, overriding the '@' sigil
+      std::optional<bool> as_element{}; // force element form, overriding the '@' sigil
+      std::optional<std::string_view> substitution_group{}; // reserved for a future task; not yet consumed
+   };
+
+   // Per-type XML-only schema metadata. Optional -- absent for most types.
+   // Left undefined (unlike glz::json_schema<T>, which defaults to an empty
+   // body) so that `requires { xml_schema<T>{}; }` can detect whether a
+   // specialization exists, exactly as glz::to/glz::from are declared
+   // incomplete in glaze/forward.hpp.
+   //
+   // A specialization declares one glz::xml_schema_field member per struct
+   // member it wants to annotate -- matched by member name against
+   // glz::meta<T>, the same way glz::json_schema<T> members are matched (see
+   // xml::detail::has_member_entry, shared by both) -- plus, optionally,
+   // `static constexpr std::string_view target_namespace` and
+   // `static constexpr std::string_view namespace_prefix`.
+   //
+   // Division of responsibility: glz::json_schema<T> supplies annotations
+   // shared with JSON Schema (descriptions, numeric/string facets);
+   // glz::xml_schema<T> supplies only what glz::schema cannot express. The two
+   // are disjoint by construction, so there is no precedence puzzle in the
+   // common case. Where both could express the same concept -- currently,
+   // only the base XSD type of a member -- glz::xml_schema wins; see
+   // xml::detail::xml_type_override.
+   template <class T>
+   struct xml_schema;
+}
 
 namespace glz::xml
 {
@@ -149,12 +188,19 @@ namespace glz::xml
       concept named_xsd_type = xml_reflected_object<T> || glaze_enum_t<T>;
 
       // Resolves the XSD "type" attribute value for a (already nullable/array
-      // unwrapped) member type: a sanitized named-type reference for structs
-      // and enums, the built-in scalar mapping for everything else.
+      // unwrapped) member type: an explicit override (Task 22's
+      // xml_schema<T>::xsd_type, resolution step 1) if given, else a
+      // sanitized named-type reference for structs and enums, else the
+      // built-in scalar mapping (resolution step 3 -- step 2, the
+      // glz::json_schema<T> format substitution, is resolved by
+      // write_facet_base_type before reaching here).
       template <class D, class B>
-      void write_type_ref(is_context auto& ctx, B& b, auto& ix)
+      void write_type_ref(is_context auto& ctx, B& b, auto& ix, std::optional<std::string_view> override_type = {})
       {
-         if constexpr (named_xsd_type<D>) {
+         if (override_type) {
+            append_raw(*override_type, ctx, b, ix);
+         }
+         else if constexpr (named_xsd_type<D>) {
             append_raw(sanitized_name_v<D>, ctx, b, ix);
          }
          else {
@@ -194,20 +240,52 @@ namespace glz::xml
       // glz::write_json_schema also drives this -- see glz::json_schema_t
       // and glz::json_schema_type in core/meta.hpp for the detection
       // machinery, reused verbatim rather than re-implemented here.
+      //
+      // Task 22 reuses the member-matching half of that machinery
+      // (has_member_entry/member_entry_index below) for glz::xml_schema<T>
+      // too, since both are "reflected annotation aggregate, matched by
+      // member name against T" lookups differing only in which annotation
+      // type is being searched.
+
+      // Shared by glz::json_schema<T> and glz::xml_schema<T>: does member I
+      // of T (matched by reflected key name) have a corresponding entry in
+      // some other reflected annotation aggregate SchemaT (json_schema_type<T>
+      // or xml_schema<T>)?
+      template <class SchemaT, class T, size_t I>
+      consteval bool has_member_entry()
+      {
+         constexpr auto schema_size = reflect<SchemaT>::size;
+         if constexpr (schema_size > 0) {
+            constexpr auto key = reflect<T>::keys[I];
+            constexpr auto& schema_keys = reflect<SchemaT>::keys;
+            for (size_t i = 0; i < schema_size; ++i) {
+               if (schema_keys[i] == key) return true;
+            }
+         }
+         return false;
+      }
+
+      // The index of member I's key within SchemaT's own keys. Only valid --
+      // and only ever called -- when has_member_entry<SchemaT, T, I>() is true.
+      template <class SchemaT, class T, size_t I>
+         requires(has_member_entry<SchemaT, T, I>())
+      consteval size_t member_entry_index()
+      {
+         constexpr auto key = reflect<T>::keys[I];
+         constexpr auto& schema_keys = reflect<SchemaT>::keys;
+         constexpr auto schema_size = reflect<SchemaT>::size;
+         for (size_t i = 0; i < schema_size; ++i) {
+            if (schema_keys[i] == key) return i;
+         }
+         return schema_size; // unreachable: has_member_entry<SchemaT, T, I>() guarantees a match
+      }
 
       // Whether member I of T has a corresponding glz::schema entry.
       template <class T, size_t I>
       consteval bool has_member_schema()
       {
          if constexpr (glz::json_schema_t<T>) {
-            constexpr auto schema_size = reflect<json_schema_type<T>>::size;
-            if constexpr (schema_size > 0) {
-               constexpr auto key = reflect<T>::keys[I];
-               constexpr auto& schema_keys = reflect<json_schema_type<T>>::keys;
-               for (size_t i = 0; i < schema_size; ++i) {
-                  if (schema_keys[i] == key) return true;
-               }
-            }
+            return has_member_entry<json_schema_type<T>, T, I>();
          }
          return false;
       }
@@ -219,13 +297,7 @@ namespace glz::xml
          requires(has_member_schema<T, I>())
       consteval size_t member_schema_index()
       {
-         constexpr auto key = reflect<T>::keys[I];
-         constexpr auto& schema_keys = reflect<json_schema_type<T>>::keys;
-         constexpr auto schema_size = reflect<json_schema_type<T>>::size;
-         for (size_t i = 0; i < schema_size; ++i) {
-            if (schema_keys[i] == key) return i;
-         }
-         return schema_size; // unreachable: has_member_schema<T, I>() guarantees a match
+         return member_entry_index<json_schema_type<T>, T, I>();
       }
 
       // Copies out the glz::schema authored for member I of T. Mirrors the
@@ -239,6 +311,96 @@ namespace glz::xml
          static constexpr auto idx = member_schema_index<T, I>();
          static const auto schema_v = json_schema_type<T>{};
          return get<idx>(to_tie(schema_v));
+      }
+
+      // ------------------------------------------------------------------
+      // Task 22: glz::xml_schema<T> lookup and resolution.
+
+      // Whether T has a glz::xml_schema<T> specialization at all. The primary
+      // template is left undefined (see glz::xml_schema's declaration), so
+      // this is false whenever xml_schema<T> is an incomplete type -- an
+      // ordinary SFINAE-in-a-requires-expression check, the same technique
+      // glz::write_supported/read_supported use for glz::to/glz::from.
+      template <class T>
+      concept has_xml_schema = requires { glz::xml_schema<T>{}; };
+
+      // Whether member I of T has a corresponding glz::xml_schema_field entry.
+      template <class T, size_t I>
+      consteval bool has_member_xml_schema()
+      {
+         if constexpr (has_xml_schema<T>) {
+            return has_member_entry<glz::xml_schema<T>, T, I>();
+         }
+         return false;
+      }
+
+      // The index of member I's key within glz::xml_schema<T>'s own keys.
+      // Only valid -- and only ever called -- when
+      // has_member_xml_schema<T, I>() is true.
+      template <class T, size_t I>
+         requires(has_member_xml_schema<T, I>())
+      consteval size_t member_xml_schema_index()
+      {
+         return member_entry_index<glz::xml_schema<T>, T, I>();
+      }
+
+      // Copies out the glz::xml_schema_field authored for member I of T.
+      // Unlike glz::schema, xml_schema_field holds only
+      // std::optional<std::string_view>/std::optional<bool> -- both literal
+      // types -- so, unlike get_member_schema, this runs entirely at compile
+      // time; no boxed-field runtime-copy workaround is needed.
+      template <class T, size_t I>
+         requires(has_member_xml_schema<T, I>())
+      consteval xml_schema_field get_member_xml_schema_field()
+      {
+         constexpr auto idx = member_xml_schema_index<T, I>();
+         constexpr auto v = glz::xml_schema<T>{};
+         return get<idx>(to_tie(v));
+      }
+
+      // Step 1 of the resolution order (xml_schema<T> xsd_type, if present).
+      // Steps 2 (glz::json_schema<T> format substitution) and 3
+      // (xsd_type_of<Member>()/named-type default) are resolved where they
+      // already lived -- see write_facet_base_type and write_type_ref -- this
+      // only ever supplies the highest-priority override, since xml_schema
+      // wins whenever both could express the same concept.
+      template <class T, size_t I>
+      consteval std::optional<std::string_view> xml_type_override()
+      {
+         if constexpr (has_member_xml_schema<T, I>()) {
+            constexpr auto field = get_member_xml_schema_field<T, I>();
+            if constexpr (field.xsd_type.has_value()) {
+               return field.xsd_type;
+            }
+         }
+         return std::nullopt;
+      }
+
+      // Whether member I's attribute-vs-element form is forced by
+      // xml_schema<T>, overriding the '@' sigil that ordinarily decides it.
+      // Setting both as_attribute and as_element on the same member is a
+      // contradiction and a compile error.
+      template <class T, size_t I>
+      consteval bool xsd_effective_is_attribute()
+      {
+         constexpr auto key = reflect<T>::keys[I];
+         if constexpr (has_member_xml_schema<T, I>()) {
+            constexpr auto field = get_member_xml_schema_field<T, I>();
+            static_assert(!(field.as_attribute.has_value() && field.as_element.has_value()),
+                          "glz::xml_schema_field: as_attribute and as_element cannot both be set on the same member");
+            if constexpr (field.as_attribute.has_value()) {
+               return *field.as_attribute;
+            }
+            else if constexpr (field.as_element.has_value()) {
+               return !*field.as_element;
+            }
+            else {
+               return xml::is_attribute_key(key);
+            }
+         }
+         else {
+            return xml::is_attribute_key(key);
+         }
       }
 
       // Facets that only make sense inside an <xs:restriction> -- their
@@ -456,14 +618,20 @@ namespace glz::xml
       }
 
       // The base type used for a faceted member's type="..." attribute (no
-      // restriction facets) or its <xs:restriction base="...">: format
-      // substitution takes priority over the ordinary named-type/builtin
-      // resolution, since a JSON Schema `format` describes the same
-      // underlying string more precisely than xs:string alone can.
+      // restriction facets) or its <xs:restriction base="...">. Implements
+      // the full Task 22 resolution order: an xml_schema<T> xsd_type override
+      // (step 1) wins over glz::json_schema<T>'s format substitution (step 2,
+      // since a JSON Schema `format` describes the same underlying string
+      // more precisely than xs:string alone can), which in turn wins over the
+      // ordinary named-type/builtin resolution (step 3).
       template <class Inner, class B>
-      void write_facet_base_type(const schema& s, bool format_has_builtin, is_context auto& ctx, B& b, auto& ix)
+      void write_facet_base_type(const schema& s, bool format_has_builtin,
+                                 std::optional<std::string_view> type_override, is_context auto& ctx, B& b, auto& ix)
       {
-         if (s.format) {
+         if (type_override) {
+            append_raw(*type_override, ctx, b, ix);
+         }
+         else if (s.format) {
             if (format_has_builtin) {
                append_raw(xsd_format_builtin(*s.format), ctx, b, ix);
             }
@@ -556,7 +724,8 @@ namespace glz::xml
       // shape (array/nullable/plain), same as the unfaceted write_xsd_element,
       // except that minItems/maxItems override an array's default bounds.
       template <class D, class B>
-      void write_xsd_faceted_scalar_element(std::string_view name, const schema& s, is_context auto& ctx, B& b,
+      void write_xsd_faceted_scalar_element(std::string_view name, const schema& s,
+                                            std::optional<std::string_view> type_override, is_context auto& ctx, B& b,
                                             auto& ix)
       {
          constexpr bool is_array = writable_array_t<D>;
@@ -599,7 +768,7 @@ namespace glz::xml
 
          if (!has_restriction) {
             append_raw(" type=\"", ctx, b, ix);
-            write_facet_base_type<Inner>(s, format_has_builtin, ctx, b, ix);
+            write_facet_base_type<Inner>(s, format_has_builtin, type_override, ctx, b, ix);
             append_raw("\"", ctx, b, ix);
 
             if constexpr (!is_array) {
@@ -635,7 +804,7 @@ namespace glz::xml
 
          if (has_restriction) {
             append_raw("<xs:simpleType><xs:restriction base=\"", ctx, b, ix);
-            write_facet_base_type<Inner>(s, format_has_builtin, ctx, b, ix);
+            write_facet_base_type<Inner>(s, format_has_builtin, type_override, ctx, b, ix);
             append_raw("\">", ctx, b, ix);
             write_restriction_body(s, format_pattern, ctx, b, ix);
             append_raw("</xs:restriction></xs:simpleType>", ctx, b, ix);
@@ -645,13 +814,14 @@ namespace glz::xml
       }
 
       template <class ValT, class B>
-      void write_xsd_attribute(std::string_view name, is_context auto& ctx, B& b, auto& ix)
+      void write_xsd_attribute(std::string_view name, is_context auto& ctx, B& b, auto& ix,
+                               std::optional<std::string_view> type_override = {})
       {
          using V = schema_unwrap_nullable_t<ValT>;
          append_raw("<xs:attribute name=\"", ctx, b, ix);
          append_raw(name, ctx, b, ix);
          append_raw("\" type=\"", ctx, b, ix);
-         write_type_ref<V>(ctx, b, ix);
+         write_type_ref<V>(ctx, b, ix, type_override);
          if constexpr (nullable_like<ValT>) {
             append_raw("\" use=\"optional\"/>", ctx, b, ix);
          }
@@ -661,7 +831,8 @@ namespace glz::xml
       }
 
       template <class ValT, class B>
-      void write_xsd_element(std::string_view name, is_context auto& ctx, B& b, auto& ix)
+      void write_xsd_element(std::string_view name, is_context auto& ctx, B& b, auto& ix,
+                             std::optional<std::string_view> type_override = {})
       {
          using D = std::remove_cvref_t<ValT>;
          if constexpr (is_variant<D>) {
@@ -672,44 +843,64 @@ namespace glz::xml
             append_raw(name, ctx, b, ix);
             append_raw("\" type=\"", ctx, b, ix);
             if constexpr (writable_array_t<D>) {
-               write_type_ref<std::remove_cvref_t<range_value_t<D>>>(ctx, b, ix);
+               write_type_ref<std::remove_cvref_t<range_value_t<D>>>(ctx, b, ix, type_override);
                append_raw("\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>", ctx, b, ix);
             }
             else if constexpr (nullable_like<D>) {
-               write_type_ref<schema_unwrap_nullable_t<D>>(ctx, b, ix);
+               write_type_ref<schema_unwrap_nullable_t<D>>(ctx, b, ix, type_override);
                append_raw("\" minOccurs=\"0\"/>", ctx, b, ix);
             }
             else {
-               write_type_ref<D>(ctx, b, ix);
+               write_type_ref<D>(ctx, b, ix, type_override);
                append_raw("\"/>", ctx, b, ix);
             }
          }
       }
 
-      // Entry point from write_xsd_complex_type_body: dispatches to the
-      // faceted renderer above for a member with a glz::schema entry, or to
-      // the ordinary write_xsd_element otherwise. A faceted variant member
-      // falls back to the ordinary <xs:choice> rendering -- no facet in the
-      // table has a meaning per-alternative of a choice.
+      // Entry point from write_xsd_complex_type_body for members rendered as
+      // elements: dispatches to the faceted renderer above for a member with
+      // a glz::schema entry, or to the ordinary write_xsd_element otherwise.
+      // A faceted variant member falls back to the ordinary <xs:choice>
+      // rendering -- no facet in the table has a meaning per-alternative of a
+      // choice. The name is always sigil-stripped: a member normally
+      // sigil-marked "@attr" but forced to element form by xml_schema<T> (see
+      // xsd_effective_is_attribute) must not carry the '@' into its element
+      // name.
       template <class T, size_t I, class B>
       void write_xsd_member_element(is_context auto& ctx, B& b, auto& ix)
       {
          static constexpr auto key = reflect<T>::keys[I];
+         static constexpr auto name = xml::strip_sigil(key);
+         static constexpr auto type_override = xml_type_override<T, I>();
          if constexpr (has_member_schema<T, I>()) {
             using ValT = field_t<T, I>;
             using D = std::remove_cvref_t<ValT>;
             const schema s = get_member_schema<T, I>();
             if constexpr (is_variant<D>) {
-               write_xsd_variant_element<D>(key, ctx, b, ix);
+               write_xsd_variant_element<D>(name, ctx, b, ix);
             }
             else {
-               write_xsd_faceted_scalar_element<D>(key, s, ctx, b, ix);
+               write_xsd_faceted_scalar_element<D>(name, s, type_override, ctx, b, ix);
             }
          }
          else {
             using ValT = field_t<T, I>;
-            write_xsd_element<ValT>(key, ctx, b, ix);
+            write_xsd_element<ValT>(name, ctx, b, ix, type_override);
          }
+      }
+
+      // Entry point from write_xsd_complex_type_body for members rendered as
+      // attributes -- both ordinary "@name" members and members forced to
+      // attribute form by xml_schema<T>::as_attribute. The name is always
+      // sigil-stripped (a no-op when there was no '@' to begin with).
+      template <class T, size_t I, class B>
+      void write_xsd_member_attribute(is_context auto& ctx, B& b, auto& ix)
+      {
+         static constexpr auto key = reflect<T>::keys[I];
+         static constexpr auto name = xml::strip_sigil(key);
+         static constexpr auto type_override = xml_type_override<T, I>();
+         using ValT = field_t<T, I>;
+         write_xsd_attribute<ValT>(name, ctx, b, ix, type_override);
       }
 
       // Emits the body of a <xs:complexType> for a reflected object T (the
@@ -717,7 +908,9 @@ namespace glz::xml
       // closing tag), partitioning members by key sigil exactly as the XML
       // writer does: attributes ("@name"), a single "#text" member (switches
       // to simpleContent), and everything else (child elements in a
-      // sequence).
+      // sequence) -- except that xml_schema<T>::as_attribute/as_element (see
+      // xsd_effective_is_attribute) can move a member between the attribute
+      // and element partitions independently of its sigil.
       template <class T, class B>
       void write_xsd_complex_type_body(is_context auto& ctx, B& b, auto& ix)
       {
@@ -734,8 +927,7 @@ namespace glz::xml
             for_each<N>([&]<size_t I>() {
                static constexpr auto key = reflect<T>::keys[I];
                if constexpr (xml::is_attribute_key(key)) {
-                  using ValT = field_t<T, I>;
-                  write_xsd_attribute<ValT>(xml::strip_sigil(key), ctx, b, ix);
+                  write_xsd_member_attribute<T, I>(ctx, b, ix);
                }
             });
 
@@ -746,7 +938,7 @@ namespace glz::xml
 
             for_each<N>([&]<size_t I>() {
                static constexpr auto key = reflect<T>::keys[I];
-               if constexpr (!xml::is_attribute_key(key) && !xml::is_text_key(key)) {
+               if constexpr (!xml::is_text_key(key) && !xsd_effective_is_attribute<T, I>()) {
                   write_xsd_member_element<T, I>(ctx, b, ix);
                }
             });
@@ -755,9 +947,8 @@ namespace glz::xml
 
             for_each<N>([&]<size_t I>() {
                static constexpr auto key = reflect<T>::keys[I];
-               if constexpr (xml::is_attribute_key(key)) {
-                  using ValT = field_t<T, I>;
-                  write_xsd_attribute<ValT>(xml::strip_sigil(key), ctx, b, ix);
+               if constexpr (!xml::is_text_key(key) && xsd_effective_is_attribute<T, I>()) {
+                  write_xsd_member_attribute<T, I>(ctx, b, ix);
                }
             });
          }
@@ -793,6 +984,27 @@ namespace glz::xml
          });
 
          append_raw("</xs:restriction></xs:simpleType>", ctx, b, ix);
+      }
+
+      // ------------------------------------------------------------------
+      // Task 22: <xs:schema> namespace declaration, driven by
+      // glz::xml_schema<T>::target_namespace/namespace_prefix.
+
+      // Whether T's xml_schema<T> (if any) declares a target namespace.
+      template <class T>
+      concept has_target_namespace = requires { glz::xml_schema<T>::target_namespace; };
+
+      // The namespace prefix to bind the target namespace to: xml_schema<T>'s
+      // own namespace_prefix if given, else "tns".
+      template <class T>
+      consteval std::string_view xsd_namespace_prefix()
+      {
+         if constexpr (requires { glz::xml_schema<T>::namespace_prefix; }) {
+            return glz::xml_schema<T>::namespace_prefix;
+         }
+         else {
+            return "tns";
+         }
       }
 
       // ------------------------------------------------------------------
@@ -881,7 +1093,26 @@ namespace glz
       }
 
       xml::detail::append_raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n", ctx, buffer, ix);
-      xml::detail::append_raw("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n", ctx, buffer, ix);
+      if constexpr (xml::detail::has_target_namespace<V>) {
+         // A target namespace requires stating the form defaults: local
+         // elements are namespace-qualified (elementFormDefault="qualified"),
+         // local attributes are not (attributeFormDefault="unqualified") --
+         // the conventional W3C XSD recommendation.
+         constexpr std::string_view tns = xml_schema<V>::target_namespace;
+         constexpr std::string_view prefix = xml::detail::xsd_namespace_prefix<V>();
+         xml::detail::append_raw("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"", ctx,
+                                 buffer, ix);
+         xml::escape_attribute(tns, ctx, buffer, ix);
+         xml::detail::append_raw("\" xmlns:", ctx, buffer, ix);
+         xml::detail::append_raw(prefix, ctx, buffer, ix);
+         xml::detail::append_raw("=\"", ctx, buffer, ix);
+         xml::escape_attribute(tns, ctx, buffer, ix);
+         xml::detail::append_raw("\" elementFormDefault=\"qualified\" attributeFormDefault=\"unqualified\">\n", ctx,
+                                 buffer, ix);
+      }
+      else {
+         xml::detail::append_raw("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n", ctx, buffer, ix);
+      }
 
       std::vector<xml::detail::named_type_entry<B>> order{};
       xml::detail::collect_named_types<V, B>(order);

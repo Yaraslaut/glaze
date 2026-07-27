@@ -360,4 +360,107 @@ suite xsd_facets = [] {
    };
 };
 
+struct sch_xmlonly
+{
+   std::string key{};
+   std::string ref{};
+   std::string token{};
+};
+
+template <>
+struct glz::meta<sch_xmlonly>
+{
+   using T = sch_xmlonly;
+   static constexpr auto value = object("key", &T::key, "ref", &T::ref, "token", &T::token);
+   static constexpr std::string_view root_name = "rec";
+};
+
+template <>
+struct glz::xml_schema<sch_xmlonly>
+{
+   static constexpr std::string_view target_namespace = "urn:example:rec";
+   static constexpr std::string_view namespace_prefix = "r";
+
+   xml_schema_field key{.xsd_type = "xs:ID"};
+   xml_schema_field ref{.xsd_type = "xs:IDREF"};
+   xml_schema_field token{.xsd_type = "xs:NMTOKEN", .as_attribute = true};
+};
+
+// Shared annotations and XML-only annotations coexist on one type.
+struct sch_both
+{
+   int n{};
+};
+
+template <>
+struct glz::meta<sch_both>
+{
+   using T = sch_both;
+   static constexpr auto value = object("n", &T::n);
+   static constexpr std::string_view root_name = "both";
+};
+
+template <>
+struct glz::json_schema<sch_both>
+{
+   schema n{.description = "shared description", .minimum = 0L};
+};
+
+template <>
+struct glz::xml_schema<sch_both>
+{
+   static constexpr std::string_view target_namespace = "urn:example:both";
+   xml_schema_field n{.xsd_type = "xs:nonNegativeInteger"};
+};
+
+suite xsd_xml_only_metadata = [] {
+   "target_namespace_is_emitted"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_xmlonly>().value_or("<error>");
+      expect(has(xsd, R"(targetNamespace="urn:example:rec")")) << xsd;
+      expect(has(xsd, R"(xmlns:r="urn:example:rec")")) << xsd;
+      // Declaring a target namespace requires stating the form defaults.
+      expect(has(xsd, R"(elementFormDefault="qualified")")) << xsd;
+   };
+
+   "xsd_type_override"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_xmlonly>().value_or("<error>");
+      expect(has(xsd, R"(name="key" type="xs:ID")")) << xsd;
+      expect(has(xsd, R"(name="ref" type="xs:IDREF")")) << xsd;
+   };
+
+   "as_attribute_forces_attribute_form"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_xmlonly>().value_or("<error>");
+      // 'token' has no '@' sigil but is forced to attribute form.
+      expect(has(xsd, R"(<xs:attribute name="token" type="xs:NMTOKEN")")) << xsd;
+      expect(!has(xsd, R"(<xs:element name="token")")) << xsd;
+   };
+
+   "absent_xml_schema_specialization_is_fine"_test = [] {
+      // sch_book has no glz::xml_schema; generation must still work.
+      const auto xsd = glz::write_xml_schema<sch_book>().value_or("<error>");
+      expect(has(xsd, "<xs:schema")) << xsd;
+      expect(!has(xsd, "targetNamespace")) << xsd;
+   };
+
+   "shared_and_xml_only_annotations_combine"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_both>().value_or("<error>");
+      // description comes from glz::json_schema...
+      expect(has(xsd, "<xs:documentation>shared description</xs:documentation>")) << xsd;
+      // ...the type override comes from glz::xml_schema...
+      expect(has(xsd, "xs:nonNegativeInteger")) << xsd;
+      // ...and the minimum facet from glz::json_schema still applies.
+      expect(has(xsd, R"(<xs:minInclusive value="0"/>)")) << xsd;
+      expect(has(xsd, R"(targetNamespace="urn:example:both")")) << xsd;
+   };
+
+   "xml_only_schemas_are_still_parseable"_test = [] {
+      for (const auto& xsd : {glz::write_xml_schema<sch_xmlonly>().value_or("<error>"),
+                              glz::write_xml_schema<sch_both>().value_or("<error>")}) {
+         glz::generic g{};
+         const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
+         expect(!ec) << glz::format_error(ec, xsd);
+      }
+   };
+};
+
 int main() {}
