@@ -645,11 +645,13 @@ namespace glz
    // mutated between tries. Mirrors include/glaze/yaml/read.hpp's variant
    // fallback (its is_variant<T> struct from<YAML, T>::op, around line
    // 6244-6273): a speculative attempt runs against a scratch copy of `it`,
-   // and on failure the shared ctx.error is cleared and ctx.element_stack is
-   // truncated back to its pre-attempt size -- necessary here (unlike a
-   // format with no such stack) because a partially-parsed nested element
-   // that never reached its own end tag would otherwise leave stale entries
-   // behind for the next alternative. error_code::no_matching_variant_type
+   // and on failure the shared ctx.error is cleared and ctx's speculative-parse
+   // state (element_stack, ns_bindings, ns_scope_marks -- see xml_context::mark()
+   // / rollback() in common.hpp) is rolled back to its pre-attempt snapshot --
+   // necessary here (unlike a format with no such state) because a
+   // partially-parsed nested element that never reached its own end tag, or a
+   // namespace scope it opened but never closed, would otherwise leave stale
+   // entries behind for the next alternative. error_code::no_matching_variant_type
    // is set only if every alternative fails.
    template <is_variant T>
       requires(!custom_read<T>)
@@ -666,9 +668,7 @@ namespace glz
          static constexpr auto N = std::variant_size_v<V>;
 
          const auto start = it;
-         const auto stack_depth = ctx.element_stack.size();
-         const auto ns_bindings_depth = ctx.ns_bindings.size();
-         const auto ns_scope_marks_depth = ctx.ns_scope_marks.size();
+         const auto mark = ctx.mark();
 
          auto try_parse = [&]<size_t I>() -> bool {
             using Alt = std::variant_alternative_t<I, V>;
@@ -682,16 +682,16 @@ namespace glz
             }
             ctx.error = error_code::none;
             ctx.custom_error_message = {};
-            ctx.element_stack.resize(stack_depth);
             // A failed alternative may have opened namespace scopes (via
             // parse_start_tag's unconditional push_ns_scope()) and bound
             // prefixes within them without ever reaching the matching
             // pop_ns_scope() on its error-exit path. Left in place, such a
             // prefix would stay resolvable for the rest of the document even
             // though the element that declared it never actually matched.
-            // Roll both stacks back exactly like element_stack above.
-            ctx.ns_bindings.resize(ns_bindings_depth);
-            ctx.ns_scope_marks.resize(ns_scope_marks_depth);
+            // ctx.rollback() undoes element_stack, ns_bindings, and
+            // ns_scope_marks together, in one place, so a future field added
+            // to xml_context can't be missed here the way these were.
+            ctx.rollback(mark);
             return false;
          };
 

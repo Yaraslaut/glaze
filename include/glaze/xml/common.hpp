@@ -413,6 +413,33 @@ namespace glz::xml
       std::vector<ns_binding> ns_bindings{};
       std::vector<size_t> ns_scope_marks{};
 
+      // Snapshot of the speculative-parse state, for rollback when a
+      // speculative attempt fails (see is_variant's retry in read.hpp).
+      //
+      // Keep this next to the fields it captures. A previous field added
+      // beside element_stack was not added to the rollback, which let a
+      // namespace prefix declared inside a failed alternative stay bound for
+      // the rest of the document. Colocating them means a new field's rollback
+      // is written in the same place as its declaration.
+      struct mark_t final
+      {
+         size_t element_depth{};
+         size_t ns_binding_count{};
+         size_t ns_scope_count{};
+      };
+
+      [[nodiscard]] mark_t mark() const noexcept
+      {
+         return mark_t{element_stack.size(), ns_bindings.size(), ns_scope_marks.size()};
+      }
+
+      void rollback(const mark_t& m) noexcept
+      {
+         element_stack.resize(m.element_depth);
+         ns_bindings.resize(m.ns_binding_count);
+         ns_scope_marks.resize(m.ns_scope_count);
+      }
+
       // NOT named depth(): glz::context has a `uint32_t depth` FIELD, and a
       // derived member function of the same name hides it, which breaks both
       // glz::is_context<xml_context> and the shared glz::depth_guard used by
