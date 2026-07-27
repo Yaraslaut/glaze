@@ -698,6 +698,22 @@ namespace glz
                xml::detail::append_raw(">", ctx, b, ix);
             }
 
+            // Mixed content (a "#text" key alongside element keys) must be
+            // written compactly, exactly like the reflected-object writer's
+            // `has_text` above: any indentation landing in this element's
+            // body would be absorbed into the #text value and corrupt it on
+            // read-back. Unlike the reflected-object case this is a runtime
+            // property of the map, not something known at compile time, so
+            // it is a plain bool computed once up front rather than a
+            // `constexpr` flag.
+            bool has_text = false;
+            for (auto&& [key, mapped] : *obj) {
+               if (xml::is_text_key(key)) {
+                  has_text = true;
+                  break;
+               }
+            }
+
             // Pass 2: text, then child elements.
             for (auto&& [key, mapped] : *obj) {
                if (bool(ctx.error)) [[unlikely]] {
@@ -725,9 +741,29 @@ namespace glz
                   }
                }
                if (const array_t* arr = mapped.template get_if<array_t>()) {
-                  xml::detail::write_sequence<Opts, false>(key_sv, *arr, ctx, b, ix);
+                  // write_sequence's SuppressPrettify is a non-type template
+                  // parameter, so the runtime `has_text` decides which
+                  // instantiation to call rather than being passed as an
+                  // ordinary argument.
+                  if (has_text) {
+                     xml::detail::write_sequence<Opts, true>(key_sv, *arr, ctx, b, ix);
+                  }
+                  else {
+                     xml::detail::write_sequence<Opts, false>(key_sv, *arr, ctx, b, ix);
+                  }
                }
                else {
+                  // Same indent prologue as the reflected-object writer's
+                  // pass 2 direct-child branch (has_text there is
+                  // `constexpr`; here it is the runtime flag above) -- this
+                  // was missing entirely, which is why prettify never
+                  // indented generic output at all.
+                  if constexpr (xml::check_prettify(Opts)) {
+                     if (!has_text) {
+                        xml::detail::append_indent<Opts>(ctx, b, ix);
+                        ctx.wrote_element_child = true;
+                     }
+                  }
                   xml::detail::write_wrapped_element<Opts>(key_sv, mapped, ctx, b, ix);
                }
             }

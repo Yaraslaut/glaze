@@ -278,6 +278,18 @@ namespace glz::xml::detail
                return;
             }
          }
+         // An empty or whitespace-only run is not a number: the JSON number
+         // reader's skip_ws advances straight to the end of the (possibly
+         // zero-length) buffer without consuming a single digit and reports
+         // `end_reached` either way, so it cannot be told apart from a
+         // genuine number that happens to run exactly to the end of `text`.
+         // Reject it here, before delegating, rather than let the blanket
+         // `end_reached` -> `none` clear below turn "no digits at all" into
+         // a silently successful parse that leaves `value` untouched.
+         if (xml::is_whitespace_only(text)) [[unlikely]] {
+            ctx.error = error_code::parse_number_failure;
+            return;
+         }
          const char* p = text.data();
          const char* e = p + text.size();
          from<JSON, M>::template op<json_scalar_opts>(value, ctx, p, e);

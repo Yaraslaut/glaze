@@ -2192,4 +2192,107 @@ suite conformance_gap_fixes = [] {
    };
 };
 
+struct empty_num_holder
+{
+   int i{};
+   double d{};
+   unsigned u{};
+};
+
+template <>
+struct glz::meta<empty_num_holder>
+{
+   using T = empty_num_holder;
+   static constexpr auto value = object("i", &T::i, "d", &T::d, "u", &T::u);
+};
+
+struct var_attr_point
+{
+   int x{};
+   int y{};
+};
+
+template <>
+struct glz::meta<var_attr_point>
+{
+   using T = var_attr_point;
+   static constexpr auto value = object("@x", &T::x, "@y", &T::y);
+};
+
+struct var_scalar_first
+{
+   std::variant<int, var_attr_point> v{};
+};
+
+template <>
+struct glz::meta<var_scalar_first>
+{
+   using T = var_scalar_first;
+   static constexpr auto value = object("v", &T::v);
+};
+
+suite final_review_criticals = [] {
+   "empty_text_does_not_silently_bind_to_a_number"_test = [] {
+      // The element-text path cleared end_reached unconditionally, so an empty
+      // run reported success with the member untouched -- stale data, no error.
+      empty_num_holder n{.i = 111, .d = 2.5, .u = 333};
+      const auto ec = glz::read_xml(n, std::string("<root><i/></root>"));
+      expect(bool(ec)) << "an empty numeric element must be an error, not a silent no-op";
+
+      empty_num_holder n2{.i = 111};
+      expect(bool(glz::read_xml(n2, std::string("<root><i></i></root>"))));
+
+      empty_num_holder n3{.i = 111};
+      expect(bool(glz::read_xml(n3, std::string("<root><i>   </i></root>"))));
+   };
+
+   "empty_text_still_valid_for_a_string_member"_test = [] {
+      // Regression guard: the fix must not break legitimately empty strings.
+      xml_book b{};
+      expect(!glz::read_xml(b, std::string("<book><title/><year>1</year></book>")));
+      expect(b.title == "");
+
+      xml_book b2{};
+      expect(!glz::read_xml(b2, std::string("<book><title></title><year>1</year></book>")));
+      expect(b2.title == "");
+   };
+
+   "disengaged_optional_still_works"_test = [] {
+      xml_opt_holder h{};
+      expect(!glz::read_xml(h, std::string("<h><maybe/><always>x</always></h>")));
+      expect(!h.maybe.has_value());
+   };
+
+   "variant_with_attribute_only_struct_round_trips"_test = [] {
+      // The scalar alternative "succeeded" on the empty content run, so the
+      // object alternative was never tried and every attribute was dropped.
+      const var_scalar_first h{.v = var_attr_point{.x = 7, .y = 8}};
+      const auto xml = glz::write_xml(h).value_or("<error>");
+      var_scalar_first back{};
+      const auto ec = glz::read_xml(back, xml);
+      expect(!ec) << glz::format_error(ec, xml);
+      expect(back.v.index() == size_t(1)) << "the object alternative must be selected";
+      if (back.v.index() == 1) {
+         expect(std::get<1>(back.v).x == 7);
+         expect(std::get<1>(back.v).y == 8);
+      }
+   };
+
+   "generic_prettify_does_not_corrupt_mixed_content"_test = [] {
+      // The generic writer hardcoded SuppressPrettify=false, so indentation was
+      // injected into mixed content and children were reordered ahead of #text.
+      glz::generic g{};
+      const std::string src = "<root>HELLO<item>one</item><item>two</item></root>";
+      expect(!glz::read_xml(g, src));
+
+      const auto pretty =
+         glz::write_xml<glz::xml::xml_opts{.write_declaration = false, .prettify = true}>(g, "root").value_or(
+            "<error>");
+      glz::generic back{};
+      expect(!glz::read_xml(back, pretty)) << pretty;
+      expect(back["#text"].get<std::string>() == "HELLO")
+         << "prettify must not enter an element carrying text: " << pretty;
+   };
+};
+
 int main() {}
