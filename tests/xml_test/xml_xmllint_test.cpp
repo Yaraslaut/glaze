@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,39 @@ struct glz::meta<lint_user>
    static constexpr std::string_view root_name = "user";
 };
 
+// F3: a map member. write_xml turns each entry into a child element named
+// after its runtime key (see xml/write.hpp's writable_map_t writer); the
+// generated schema must describe that, not xs:string.
+struct lint_map_holder
+{
+   std::map<std::string, int> counts{};
+};
+
+template <>
+struct glz::meta<lint_map_holder>
+{
+   using T = lint_map_holder;
+   static constexpr auto value = object("counts", &T::counts);
+   static constexpr std::string_view root_name = "holder";
+};
+
+// F4: a "#text" member coexisting with an element member --
+// object("@unit", "#text", "extra") -- needs mixed="true", not simpleContent.
+struct lint_mixed
+{
+   int unit{};
+   std::string text{};
+   int extra{};
+};
+
+template <>
+struct glz::meta<lint_mixed>
+{
+   using T = lint_mixed;
+   static constexpr auto value = object("@unit", &T::unit, "#text", &T::text, "extra", &T::extra);
+   static constexpr std::string_view root_name = "root";
+};
+
 suite xmllint_oracle = [] {
    "written_documents_are_wellformed"_test = [] {
       if (!xmllint_available()) {
@@ -146,6 +180,44 @@ suite xmllint_oracle = [] {
       const auto xml = glz::write_xml(u).value_or("<error>");
       const auto xsd = glz::write_xml_schema<lint_user>().value_or("<error>");
       expect(validates(xml, xsd, "pair2")) << "xml:\n" << xml << "\nxsd:\n" << xsd;
+   };
+
+   "scalar_root_schema_is_valid_xsd"_test = [] {
+      // F2: write_xml_schema<int>() previously emitted
+      // <xs:element name="root" type="int"/>, referencing a type definition
+      // that does not exist -- xmllint: "The QName value 'int' does not
+      // resolve to a(n) type definition."
+      if (!xmllint_available()) return;
+      const auto xsd_int = glz::write_xml_schema<int>().value_or("<error>");
+      expect(valid_xsd(xsd_int, "schema_scalar_int.xsd")) << xsd_int;
+      const auto xsd_str = glz::write_xml_schema<std::string>().value_or("<error>");
+      expect(valid_xsd(xsd_str, "schema_scalar_str.xsd")) << xsd_str;
+   };
+
+   "map_member_document_validates_against_its_own_generated_schema"_test = [] {
+      // F3: previously the schema declared `tags`'s type as xs:string even
+      // though write_xml emits one child element per map entry, so xmllint
+      // rejected our own writer's output ("Element content is not allowed,
+      // because the type definition is simple type").
+      if (!xmllint_available()) return;
+      lint_map_holder h{};
+      h.counts["alpha"] = 1;
+      h.counts["beta"] = 2;
+      const auto xml = glz::write_xml(h).value_or("<error>");
+      const auto xsd = glz::write_xml_schema<lint_map_holder>().value_or("<error>");
+      expect(validates(xml, xsd, "pair_map")) << "xml:\n" << xml << "\nxsd:\n" << xsd;
+   };
+
+   "mixed_content_document_validates_against_its_own_generated_schema"_test = [] {
+      // F4: previously a "#text" member with element siblings generated
+      // simpleContent, which cannot carry child elements, so xmllint rejected
+      // our own writer's output ("Element content is not allowed, because the
+      // content type is a simple type definition").
+      if (!xmllint_available()) return;
+      const lint_mixed m{.unit = 7, .text = "HELLO", .extra = 3};
+      const auto xml = glz::write_xml(m).value_or("<error>");
+      const auto xsd = glz::write_xml_schema<lint_mixed>().value_or("<error>");
+      expect(validates(xml, xsd, "pair_mixed")) << "xml:\n" << xml << "\nxsd:\n" << xsd;
    };
 
    "xmllint_and_glaze_agree_on_wellformedness"_test = [] {

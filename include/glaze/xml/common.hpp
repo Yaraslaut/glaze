@@ -323,7 +323,7 @@ namespace glz::xml
       template <auto Opts, class B>
       void append_indent(is_context auto& ctx, B& b, auto& ix)
       {
-         const size_t n = size_t(check_indentation_width(Opts)) * ctx.indent_depth;
+         const size_t n = size_t(xml::check_indentation_width(Opts)) * ctx.indent_depth;
          if (!ensure_space(ctx, b, ix + 1 + n)) [[unlikely]] {
             return;
          }

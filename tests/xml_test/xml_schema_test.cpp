@@ -2,6 +2,7 @@
 // For the license information refer to glaze.hpp
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <variant>
@@ -166,6 +167,19 @@ suite xsd_basics = [] {
       const auto ec = glz::write_xml_schema<sch_book>(buf);
       expect(!ec);
       expect(has(buf, "<xs:schema"));
+   };
+
+   "scalar_root_uses_builtin_type_not_a_named_reference"_test = [] {
+      // A scalar root has no glz::meta and gathers nothing via
+      // collect_named_types, so it must never reference a named type that was
+      // never defined (e.g. type="int"): the root element's type must resolve
+      // to the built-in XSD scalar mapping instead.
+      const auto xsd_int = glz::write_xml_schema<int>().value_or("<error>");
+      expect(has(xsd_int, R"(<xs:element name="root" type="xs:int"/>)")) << xsd_int;
+      expect(!has(xsd_int, R"(type="int")")) << xsd_int;
+
+      const auto xsd_str = glz::write_xml_schema<std::string>().value_or("<error>");
+      expect(has(xsd_str, R"(<xs:element name="root" type="xs:string"/>)")) << xsd_str;
    };
 };
 
@@ -456,6 +470,115 @@ suite xsd_xml_only_metadata = [] {
    "xml_only_schemas_are_still_parseable"_test = [] {
       for (const auto& xsd : {glz::write_xml_schema<sch_xmlonly>().value_or("<error>"),
                               glz::write_xml_schema<sch_both>().value_or("<error>")}) {
+         glz::generic g{};
+         const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
+         expect(!ec) << glz::format_error(ec, xsd);
+      }
+   };
+};
+
+// F3: a map member's keys are runtime values write_xml turns into child
+// elements (see xml/write.hpp's writable_map_t writer) -- the schema must not
+// describe this as xs:string.
+struct sch_map_holder
+{
+   std::map<std::string, int> tags{};
+};
+
+template <>
+struct glz::meta<sch_map_holder>
+{
+   using T = sch_map_holder;
+   static constexpr auto value = object("tags", &T::tags);
+   static constexpr std::string_view root_name = "holder";
+};
+
+suite xsd_map_members = [] {
+   "map_member_gets_a_wildcard_complextype_not_xs_string"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_map_holder>().value_or("<error>");
+      expect(!has(xsd, R"(name="tags" type="xs:string")")) << xsd;
+      expect(has(xsd, R"(<xs:element name="tags"><xs:complexType><xs:sequence>)")) << xsd;
+      expect(has(xsd, R"(<xs:any processContents="skip" minOccurs="0" maxOccurs="unbounded"/>)")) << xsd;
+   };
+
+   "map_schema_is_still_parseable"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_map_holder>().value_or("<error>");
+      glz::generic g{};
+      const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
+      expect(!ec) << glz::format_error(ec, xsd);
+   };
+};
+
+// F4/F5: a "#text" member that coexists with an element member (object("@unit",
+// "#text", "extra")) needs a mixed="true" complexType -- simpleContent cannot
+// carry child elements.
+struct sch_mixed
+{
+   int unit{};
+   std::string text{};
+   int extra{};
+};
+
+template <>
+struct glz::meta<sch_mixed>
+{
+   using T = sch_mixed;
+   static constexpr auto value = object("@unit", &T::unit, "#text", &T::text, "extra", &T::extra);
+   static constexpr std::string_view root_name = "root";
+};
+
+// F5: a non-sigil member of a "#text"-carrying type forced into attribute
+// form. Previously the has_text branch partitioned attributes by raw '@'
+// sigil only (ignoring xml_schema<T>::as_attribute), so this member vanished
+// from the schema entirely -- neither attribute nor element.
+struct sch_text_forced_attr
+{
+   std::string role{};
+   std::string text{};
+};
+
+template <>
+struct glz::meta<sch_text_forced_attr>
+{
+   using T = sch_text_forced_attr;
+   static constexpr auto value = object("role", &T::role, "#text", &T::text);
+   static constexpr std::string_view root_name = "root";
+};
+
+template <>
+struct glz::xml_schema<sch_text_forced_attr>
+{
+   xml_schema_field role{.as_attribute = true};
+};
+
+suite xsd_mixed_content = [] {
+   "text_type_with_element_members_uses_mixed_complextype"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_mixed>().value_or("<error>");
+      expect(has(xsd, R"(mixed="true")")) << xsd;
+      expect(!has(xsd, "<xs:simpleContent>")) << xsd;
+      expect(has(xsd, R"(<xs:element name="extra" type="xs:int"/>)")) << xsd;
+      expect(has(xsd, R"(<xs:attribute name="unit" type="xs:int")")) << xsd;
+   };
+
+   "text_only_with_attributes_still_uses_simplecontent"_test = [] {
+      // Regression guard: sch_attrs (attributes + #text, no element members)
+      // must keep using simpleContent -- the case F4 says is already correct
+      // and must not be disturbed.
+      const auto xsd = glz::write_xml_schema<sch_attrs>().value_or("<error>");
+      expect(has(xsd, "<xs:simpleContent>")) << xsd;
+      expect(!has(xsd, R"(mixed="true")")) << xsd;
+   };
+
+   "as_attribute_honored_for_text_carrying_type"_test = [] {
+      const auto xsd = glz::write_xml_schema<sch_text_forced_attr>().value_or("<error>");
+      expect(has(xsd, "<xs:simpleContent>")) << xsd;
+      expect(has(xsd, R"(<xs:attribute name="role" type="xs:string")")) << xsd;
+      expect(!has(xsd, R"(<xs:element name="role")")) << xsd;
+   };
+
+   "mixed_and_forced_attribute_schemas_are_still_parseable"_test = [] {
+      for (const auto& xsd : {glz::write_xml_schema<sch_mixed>().value_or("<error>"),
+                              glz::write_xml_schema<sch_text_forced_attr>().value_or("<error>")}) {
          glz::generic g{};
          const auto ec = glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, xsd);
          expect(!ec) << glz::format_error(ec, xsd);

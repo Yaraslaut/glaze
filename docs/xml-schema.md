@@ -190,15 +190,16 @@ int main()
 }
 ```
 
-`glz::xml_schema_field` has three members, all optional:
+`glz::xml_schema_field` has two members, both optional:
 
 | Field | Effect |
 |---|---|
 | `xsd_type` | Overrides the generated `type="..."` attribute, e.g. `"xs:ID"`, `"xs:IDREF"`, `"xs:NMTOKEN"` |
 | `as_attribute` | Forces the member into attribute form, overriding the `@` sigil |
-| `as_element` | Forces the member into element form, overriding the `@` sigil |
 
-Setting both `as_attribute` and `as_element` on the same field is a compile error. `target_namespace` and
+There is no `as_element`: forcing an attribute-keyed member (`"@id"`) into element form would require a
+`glz::xml_schema<T>` member literally named `@id`, which is not a valid C++ identifier and so could never be
+written -- the same trap `substitution_group` was removed for. `target_namespace` and
 `namespace_prefix` are `static constexpr std::string_view` constants on the `glz::xml_schema<T>` specialization
 itself (not per-member); declaring `target_namespace` also switches the generated schema to
 `elementFormDefault="qualified"` / `attributeFormDefault="unqualified"`, the conventional W3C recommendation.

@@ -986,6 +986,22 @@ suite nullable_variant_prettify = [] {
          << out;
    };
 
+   "prettify_with_glz_opts_compiles"_test = [] {
+      // glz::opts (the sibling-format options type, not glz::xml::xml_opts) must also work with
+      // prettify: previously this failed to compile because check_indentation_width(Opts) was
+      // called unqualified from inside namespace glz::xml, making it ambiguous with
+      // glz::check_indentation_width.
+      const xml_book b{.title = "Dune", .year = 1965};
+      const auto out = glz::write_xml<glz::opts{.prettify = true}>(b, "book").value_or("<error>");
+      expect(out ==
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<book>\n"
+             "   <title>Dune</title>\n"
+             "   <year>1965</year>\n"
+             "</book>")
+         << out;
+   };
+
    "prettify_custom_indentation_width"_test = [] {
       const xml_book b{.title = "D", .year = 1};
       const auto out =

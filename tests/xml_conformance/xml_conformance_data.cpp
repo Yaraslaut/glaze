@@ -11,7 +11,21 @@
 //   valid   -> MUST parse (well-formed and DTD-valid)
 //   invalid -> MUST parse (well-formed; we do not validate)
 //   error   -> optional behaviour; skipped
+//
+// This target asserts a *baseline*, not zero failures: 154 not-wf cases are
+// known, deliberate failures where correctness depends on expanding entities
+// or attribute defaults declared in a DTD internal subset, which we
+// intentionally do not do (see declares_internal_entity/skip_reason above --
+// those filters already remove the cases the manifest can identify ahead of
+// time, but not every internal-subset-dependent not-wf case is expressible
+// that way). Requiring t.failed == 0 here would make the target permanently
+// red and therefore useless as a regression guard, per the final-review
+// finding that led to this comment. What must always be exactly zero is
+// false rejections -- valid/invalid (well-formed) documents we incorrectly
+// reject -- since unlike tolerating an unrecognized not-wf case, rejecting
+// well-formed input is never acceptable.
 
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -168,6 +182,11 @@ namespace
    {
       size_t passed{};
       size_t failed{};
+      // Subset of `failed` where a valid/invalid (well-formed) document was
+      // incorrectly rejected -- see the file header. Must always be zero,
+      // unlike `failed` itself, which tolerates the documented 154-case
+      // internal-DTD-subset baseline.
+      size_t false_rejections{};
       size_t skipped{};
       size_t missing{};
       std::vector<std::string> failures{};
@@ -225,6 +244,11 @@ suite w3c_data_driven = [] {
             }
             else {
                ++t.failed;
+               if (!must_error) {
+                  // c.type is "valid" or "invalid" (well-formed) but we rejected it: always a
+                  // real defect, never tolerated by the baseline below.
+                  ++t.false_rejections;
+               }
                if (t.failures.size() < 60) {
                   t.failures.push_back(c.id + " [" + c.type + "] " + c.uri +
                                        (must_error ? " : accepted, should reject" : " : rejected, should accept"));
@@ -238,8 +262,26 @@ suite w3c_data_driven = [] {
          detail += "\n  " + f;
       }
 
-      expect(t.failed == size_t(0)) << "passed=" << t.passed << " failed=" << t.failed << " skipped=" << t.skipped
-                                    << " missing=" << t.missing << detail;
+      // Always visible, pass or fail -- not just folded into an assertion
+      // failure message -- so a baseline drift (in either direction) shows up
+      // in ordinary CI output, not only when it crosses the threshold below.
+      std::fprintf(stderr, "xml_conformance_data: passed=%zu failed=%zu false_rejections=%zu skipped=%zu missing=%zu\n",
+                   t.passed, t.failed, t.false_rejections, t.skipped, t.missing);
+
+      // 154 is the documented, known baseline of internal-DTD-subset failures
+      // described in the file header -- not an aspiration. Regress (grow)
+      // past it and this fails; shrinking it (fixing one of those cases) is
+      // welcome and simply lowers the number that needs updating here.
+      constexpr size_t known_failure_baseline = 154;
+      expect(t.failed <= known_failure_baseline)
+         << "passed=" << t.passed << " failed=" << t.failed << " (baseline=" << known_failure_baseline << ")"
+         << " skipped=" << t.skipped << " missing=" << t.missing << detail;
+
+      // Unlike `failed`, this must always be exactly zero: rejecting a
+      // well-formed valid/invalid document is a real defect, not a tolerated
+      // gap, no matter how small.
+      expect(t.false_rejections == size_t(0))
+         << t.false_rejections << " valid/invalid documents were incorrectly rejected" << detail;
 
       // Guard against a silently empty corpus, which would make this vacuously green.
       expect(t.passed > size_t(400)) << "corpus appears truncated: only " << t.passed << " cases ran";

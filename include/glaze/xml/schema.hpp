@@ -34,7 +34,6 @@ namespace glz
    {
       std::optional<std::string_view> xsd_type{}; // e.g. "xs:ID", "xs:IDREF", "xs:NMTOKEN"
       std::optional<bool> as_attribute{}; // force attribute form, overriding the '@' sigil
-      std::optional<bool> as_element{}; // force element form, overriding the '@' sigil
    };
 
    // Per-type XML-only schema metadata. Optional -- absent for most types.
@@ -376,22 +375,20 @@ namespace glz::xml
       }
 
       // Whether member I's attribute-vs-element form is forced by
-      // xml_schema<T>, overriding the '@' sigil that ordinarily decides it.
-      // Setting both as_attribute and as_element on the same member is a
-      // contradiction and a compile error.
+      // xml_schema<T>::as_attribute, overriding the '@' sigil that ordinarily
+      // decides it. There is no corresponding as_element: forcing an
+      // attribute-keyed member ("@id") to element form would require a
+      // glz::xml_schema<T> member literally named "@id", which is not a valid
+      // C++ identifier and so can never be written -- the same trap
+      // substitution_group was removed for (see docs/xml-schema.md).
       template <class T, size_t I>
       consteval bool xsd_effective_is_attribute()
       {
          constexpr auto key = reflect<T>::keys[I];
          if constexpr (has_member_xml_schema<T, I>()) {
             constexpr auto field = get_member_xml_schema_field<T, I>();
-            static_assert(!(field.as_attribute.has_value() && field.as_element.has_value()),
-                          "glz::xml_schema_field: as_attribute and as_element cannot both be set on the same member");
             if constexpr (field.as_attribute.has_value()) {
                return *field.as_attribute;
-            }
-            else if constexpr (field.as_element.has_value()) {
-               return !*field.as_element;
             }
             else {
                return xml::is_attribute_key(key);
@@ -837,6 +834,24 @@ namespace glz::xml
          if constexpr (is_variant<D>) {
             write_xsd_variant_element<D>(name, ctx, b, ix);
          }
+         else if constexpr (writable_map_t<D>) {
+            // A map's keys are runtime values, unlike a struct's compile-time
+            // member names, so XSD cannot enumerate the children write_xml
+            // will actually emit: one child element per entry, named after
+            // its key (see xml/write.hpp's writable_map_t writer). Falling
+            // through to xsd_type_of<D>() here would describe a document
+            // write_xml never produces (a scalar "xs:string") and xmllint
+            // would then reject our own writer's output. An inline
+            // complexType permitting any element, any number of times, is the
+            // honest representation.
+            append_raw("<xs:element name=\"", ctx, b, ix);
+            append_raw(name, ctx, b, ix);
+            append_raw(
+               "\"><xs:complexType><xs:sequence>"
+               "<xs:any processContents=\"skip\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>"
+               "</xs:sequence></xs:complexType></xs:element>",
+               ctx, b, ix);
+         }
          else {
             append_raw("<xs:element name=\"", ctx, b, ix);
             append_raw(name, ctx, b, ix);
@@ -902,14 +917,46 @@ namespace glz::xml
          write_xsd_attribute<ValT>(name, ctx, b, ix, type_override);
       }
 
+      // Whether T has a "#text" member that coexists with at least one
+      // element member (a non-attribute member other than "#text" itself).
+      // XSD's <xs:simpleContent> can only ever carry character data plus
+      // attributes -- it has no way to also permit child elements -- so a
+      // type with both text *and* element members needs a mixed="true"
+      // complexType instead (see write_xsd_complex_type_body and its caller
+      // emit_named_complex_type, which must add mixed="true" to the opening
+      // tag). False whenever T has no "#text" member at all, or its only
+      // other members are attributes, in which case the ordinary
+      // simpleContent/extension rendering is correct and unaffected.
+      template <class T>
+      consteval bool text_type_is_mixed()
+      {
+         constexpr size_t N = reflect<T>::size;
+         constexpr size_t text_idx = text_member_index<T>();
+         if constexpr (text_idx >= N) {
+            return false;
+         }
+         else {
+            bool found = false;
+            for_each<N>([&]<size_t I>() {
+               if constexpr (I != text_idx) {
+                  if constexpr (!xsd_effective_is_attribute<T, I>()) {
+                     found = true;
+                  }
+               }
+            });
+            return found;
+         }
+      }
+
       // Emits the body of a <xs:complexType> for a reflected object T (the
       // part between the opening tag -- named or anonymous -- and its
       // closing tag), partitioning members by key sigil exactly as the XML
       // writer does: attributes ("@name"), a single "#text" member (switches
-      // to simpleContent), and everything else (child elements in a
-      // sequence) -- except that xml_schema<T>::as_attribute/as_element (see
-      // xsd_effective_is_attribute) can move a member between the attribute
-      // and element partitions independently of its sigil.
+      // to simpleContent, or to a mixed="true" sequence when text_type_is_mixed
+      // -- see above), and everything else (child elements in a sequence) --
+      // except that xml_schema<T>::as_attribute (see xsd_effective_is_attribute)
+      // can move a member from the element partition into the attribute
+      // partition independently of its sigil.
       template <class T, class B>
       void write_xsd_complex_type_body(is_context auto& ctx, B& b, auto& ix)
       {
@@ -917,15 +964,39 @@ namespace glz::xml
          static constexpr size_t text_idx = text_member_index<T>();
          static constexpr bool has_text = text_idx < N;
 
-         if constexpr (has_text) {
+         if constexpr (has_text && text_type_is_mixed<T>()) {
+            // Mixed content: "#text" coexists with at least one element
+            // member. simpleContent genuinely cannot express this (xmllint:
+            // "Element content is not allowed, because the content type is a
+            // simple type definition"), so the caller opens this as a
+            // mixed="true" complexType instead of a plain named one; a mixed
+            // complexType implicitly permits character data anywhere its
+            // content model allows an element, so only the element members
+            // (not the text itself) need listing here.
+            append_raw("<xs:sequence>", ctx, b, ix);
+
+            for_each<N>([&]<size_t I>() {
+               if constexpr (I != text_idx && !xsd_effective_is_attribute<T, I>()) {
+                  write_xsd_member_element<T, I>(ctx, b, ix);
+               }
+            });
+
+            append_raw("</xs:sequence>", ctx, b, ix);
+
+            for_each<N>([&]<size_t I>() {
+               if constexpr (I != text_idx && xsd_effective_is_attribute<T, I>()) {
+                  write_xsd_member_attribute<T, I>(ctx, b, ix);
+               }
+            });
+         }
+         else if constexpr (has_text) {
             using TextValT = field_t<T, text_idx>;
             append_raw("<xs:simpleContent><xs:extension base=\"", ctx, b, ix);
             append_raw(xsd_type_of<schema_unwrap_nullable_t<TextValT>>(), ctx, b, ix);
             append_raw("\">", ctx, b, ix);
 
             for_each<N>([&]<size_t I>() {
-               static constexpr auto key = reflect<T>::keys[I];
-               if constexpr (xml::is_attribute_key(key)) {
+               if constexpr (I != text_idx && xsd_effective_is_attribute<T, I>()) {
                   write_xsd_member_attribute<T, I>(ctx, b, ix);
                }
             });
@@ -953,13 +1024,23 @@ namespace glz::xml
          }
       }
 
-      // <xs:complexType name="..."> ... </xs:complexType>
+      // <xs:complexType name="..."> ... </xs:complexType> -- or
+      // <xs:complexType name="..." mixed="true"> when T has a "#text" member
+      // that coexists with element members (see text_type_is_mixed): the
+      // mixed attribute must be on this opening tag, so it is decided here
+      // rather than inside write_xsd_complex_type_body, which only fills the
+      // body between the tags this function writes.
       template <class T, class B>
       void emit_named_complex_type(xml::xml_context& ctx, B& b, size_t& ix)
       {
          append_raw("<xs:complexType name=\"", ctx, b, ix);
          append_raw(sanitized_name_v<T>, ctx, b, ix);
-         append_raw("\">", ctx, b, ix);
+         if constexpr (text_type_is_mixed<T>()) {
+            append_raw("\" mixed=\"true\">", ctx, b, ix);
+         }
+         else {
+            append_raw("\">", ctx, b, ix);
+         }
          write_xsd_complex_type_body<T>(ctx, b, ix);
          append_raw("</xs:complexType>", ctx, b, ix);
       }
@@ -1123,7 +1204,19 @@ namespace glz
       xml::detail::append_raw("  <xs:element name=\"", ctx, buffer, ix);
       xml::detail::append_raw(root_name, ctx, buffer, ix);
       xml::detail::append_raw("\" type=\"", ctx, buffer, ix);
-      xml::detail::append_raw(xml::detail::sanitized_name_v<V>, ctx, buffer, ix);
+      // Named types (structs/enums) reference their top-level XSD definition by
+      // name; anything else (a scalar, or a container/nullable/variant root --
+      // none of which get a named definition of their own, see
+      // xml::detail::named_xsd_type) must resolve to a built-in XSD type
+      // instead. Emitting sanitized_name_v<V> unconditionally here previously
+      // produced schemas like `type="int"` for a scalar root, which xmllint
+      // rejects because no such type definition exists.
+      if constexpr (xml::detail::named_xsd_type<V>) {
+         xml::detail::append_raw(xml::detail::sanitized_name_v<V>, ctx, buffer, ix);
+      }
+      else {
+         xml::detail::append_raw(xml::xsd_type_of<V>(), ctx, buffer, ix);
+      }
       xml::detail::append_raw("\"/>\n</xs:schema>", ctx, buffer, ix);
 
       if (bool(ctx.error)) [[unlikely]] {
