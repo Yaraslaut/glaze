@@ -68,15 +68,12 @@ suite xmltest_not_wf = [] {
       // The lowercase form is well-formed.
       expect(accepts(R"(<doc>&#x58;</doc>)"));
    };
-   // FINDING (do not "fix" by inverting): as transcribed, U+0300 (0xCC 0x80) sits in *element
-   // content*, not in a Name, so it is legal per the XML Char production and both xmllint and
-   // glz::read_xml correctly accept it (glz::xml::is_name_start_char(0x0300) is false, but that
-   // rule only applies to Name tokens, cf. tests/xml_test/xml_test.cpp:103,148). The upstream
-   // xmltest/not-wf/sa/140.xml case tests a combining character starting a *Name*; this
-   // transcription does not reproduce that condition, so the "reject" expectation below is a
-   // transcription defect in the task brief, not a parser defect. Left unmodified per
-   // instructions: report, do not adjust the expectation.
-   "not-wf-sa-140: name starts with a combining character"_test = [] { expect(rejects("<doc>\xCC\x80x</doc>")); };
+   // not-wf-sa-140 is deliberately NOT transcribed. The upstream document is
+   //     <!DOCTYPE doc [<!ENTITY e "<&#x309a;></&#x309a;>">]><doc>&e;</doc>
+   // which uses U+309A as an element NAME, and it is marked EDITION="1 2 3 4".
+   // We target XML 1.0 5th edition, which relaxed the name productions so that
+   // character is legal -- xmllint accepts it for the same reason. The Task 17
+   // harness excludes it via the same EDITION filter, so the two agree.
    "not-wf-not-sa-001: XML declaration must be first"_test = [] {
       expect(rejects("\n<?xml version=\"1.0\"?><doc></doc>"));
    };
