@@ -2104,4 +2104,38 @@ suite namespace_scope_rollback = [] {
    };
 };
 
+suite illegal_chars_rejected_everywhere = [] {
+   "xml_char_production_applies_to_every_construct"_test = [] {
+      // XML 1.0 [2] Char applies to the whole document, not only character
+      // data. parse_char_data validated it; comments, PIs and attribute values
+      // did not. W3C not-wf-sa-031 and not-wf-sa-032 cover the PI and comment
+      // cases.
+      auto rejects = [](const std::string& d) {
+         glz::generic g{};
+         return bool(glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, d));
+      };
+      const std::string ff(1, '\f'); // form feed, not a legal Char
+      const std::string vt(1, '\v'); // vertical tab, not a legal Char
+      const std::string nul(1, '\0');
+
+      expect(rejects("<doc><?pi a" + ff + "b?></doc>")) << "form feed in a PI";
+      expect(rejects("<doc><!-- a" + ff + "b --></doc>")) << "form feed in a comment";
+      expect(rejects("<doc a=\"x" + ff + "y\"/>")) << "form feed in an attribute value";
+      expect(rejects("<doc>a" + ff + "b</doc>")) << "form feed in text";
+      expect(rejects("<doc><?pi a" + vt + "b?></doc>")) << "vertical tab in a PI";
+      expect(rejects("<doc><!-- a" + vt + "b --></doc>")) << "vertical tab in a comment";
+      expect(rejects(std::string{"<doc><!-- a"} + nul + "b --></doc>")) << "NUL in a comment";
+
+      // Legal characters must still be accepted -- tab, LF and CR are Chars.
+      auto accepts = [](const std::string& d) {
+         glz::generic g{};
+         return !glz::read_xml<glz::xml::xml_opts{.error_on_unknown_keys = false}>(g, d);
+      };
+      expect(accepts("<doc><!-- a\tb\nc\rd --></doc>")) << "tab/LF/CR are legal in a comment";
+      expect(accepts("<doc><?pi a\tb\nc?></doc>")) << "tab/LF in a PI";
+      expect(accepts("<doc a=\"x\ty\"/>")) << "tab in an attribute value (normalized, not rejected)";
+      expect(accepts("<doc>caf\xC3\xA9 \xE2\x82\xAC</doc>")) << "multibyte UTF-8 still fine";
+   };
+};
+
 int main() {}

@@ -569,6 +569,35 @@ namespace glz::xml
       return true;
    }
 
+   // Decodes one UTF-8 scalar at 'it' and validates it against XML 1.0 [2]
+   // Char, the production that governs which code points may appear ANYWHERE
+   // in a document, not only in character data. Returns the scalar's byte
+   // length (never 0) on success. On failure -- malformed UTF-8 (see
+   // decode_utf8: overlong, an encoded surrogate, out of range, truncated) or
+   // a code point [2] Char forbids outright (e.g. a C0 control like form feed
+   // or vertical tab, or NUL) -- sets ctx.error and returns 0, leaving 'cp'
+   // unspecified.
+   //
+   // This is the one place that check lives. parse_char_data and parse_cdata
+   // apply it while copying text out; parse_comment and parse_pi apply it
+   // while merely scanning past bytes they don't copy; parse_attribute_value
+   // applies it to whatever isn't handled by reference expansion or
+   // tab/LF/CR normalization. Previously parse_comment, parse_pi and
+   // parse_attribute_value scanned for their terminator without checking the
+   // bytes they passed over, so e.g. a form feed or NUL was silently accepted
+   // inside a comment, PI or attribute value (W3C not-wf-sa-031,
+   // not-wf-sa-032). Keeping a single implementation here means the five call
+   // sites cannot drift apart again the way they did before.
+   inline size_t decode_xml_char(const char* it, const char* end, char32_t& cp, xml_context& ctx) noexcept
+   {
+      const size_t n = decode_utf8(it, end, cp);
+      if (n == 0 || !is_xml_char(cp)) {
+         ctx.error = error_code::syntax_error;
+         return 0;
+      }
+      return n;
+   }
+
    // Comment ::= '<!--' ((Char - '-') | ('-' (Char - '-')))* '-->'
    // i.e. '--' may not occur anywhere in the body, and therefore a comment may
    // not end in '--->' either (the extra '-' would form a forbidden '--' pair
@@ -595,7 +624,12 @@ namespace glz::xml
             ctx.error = error_code::syntax_error; // '--' not immediately followed by '>'
             return false;
          }
-         ++p;
+         char32_t cp{};
+         const size_t n = decode_xml_char(p, end, cp, ctx);
+         if (n == 0) {
+            return false;
+         }
+         p += n;
       }
       ctx.error = error_code::unexpected_end;
       return false;
@@ -652,7 +686,12 @@ namespace glz::xml
             it = p + 2;
             return true;
          }
-         ++p;
+         char32_t cp{};
+         const size_t n = decode_xml_char(p, end, cp, ctx);
+         if (n == 0) {
+            return false;
+         }
+         p += n;
       }
    }
 
@@ -1062,8 +1101,13 @@ namespace glz::xml
             ++p;
             continue;
          }
-         out.push_back(c);
-         ++p;
+         char32_t cp{};
+         const size_t n = decode_xml_char(p, end, cp, ctx);
+         if (n == 0) {
+            return false;
+         }
+         out.append(p, n);
+         p += n;
       }
    }
 
@@ -1313,9 +1357,8 @@ namespace glz::xml
          }
 
          char32_t cp{};
-         const size_t n = decode_utf8(p, end, cp);
-         if (n == 0 || !is_xml_char(cp)) {
-            ctx.error = error_code::syntax_error;
+         const size_t n = decode_xml_char(p, end, cp, ctx);
+         if (n == 0) {
             return false;
          }
          out.append(p, n);
@@ -1376,9 +1419,8 @@ namespace glz::xml
          }
 
          char32_t cp{};
-         const size_t n = decode_utf8(it, end, cp);
-         if (n == 0 || !is_xml_char(cp)) {
-            ctx.error = error_code::syntax_error;
+         const size_t n = decode_xml_char(it, end, cp, ctx);
+         if (n == 0) {
             return false;
          }
          out.append(it, n);
