@@ -90,6 +90,7 @@ nav:
    - Stencil/Mustache: stencil-mustache.md
    - TOML: toml.md
    - YAML: yaml.md
+   - XML: xml.md
    - EETF: EETF/erlang-external-term-format.md
  - Serialization/Parsing:
    - Automatic Enum Strings: enum-reflection.md
@@ -106,6 +107,7 @@ nav:
    - JSON Merge Patch (RFC 7386): json-merge-patch.md
    - JMESPath: JMESPath.md
    - JSON Schema: json-schema.md
+   - XML Schema (XSD): xml-schema.md
    - Field Validation: field-validation.md
    - Partial Read/Write:
      - Partial Read: partial-read.md

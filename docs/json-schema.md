@@ -8,6 +8,12 @@ auto schema = glz::write_json_schema<my_struct>().value();
 
 This can be used for autocomplete, linting, and validation of user input/config files in editors like VS Code that support JSON Schema.
 
+> **Note:** `glz::json_schema<T>` now feeds both the JSON Schema generator and
+> the XSD generator (`glz::write_xml_schema<T>()`). Annotations written once
+> apply to both. XML-only concepts — target namespaces, `xs:ID`/`xs:IDREF`
+> types, attribute-vs-element form — live in a separate optional
+> `glz::xml_schema<T>` specialization. See [XML Schema](xml-schema.md).
+
 ![autocomplete example](https://user-images.githubusercontent.com/9817348/199346159-8b127c7b-a9ac-49fe-b86d-71350f0e1b10.png)
 
 ![linting example](https://user-images.githubusercontent.com/9817348/199347118-ef7e9f74-ed20-4ff5-892a-f70ff1df23b5.png)
