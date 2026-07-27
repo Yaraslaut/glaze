@@ -11,3 +11,13 @@ endif ()
 add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
 
 target_code_coverage(${PROJECT_NAME} AUTO ALL)
+
+add_executable(${PROJECT_NAME}_struct ${PROJECT_NAME}_struct.cpp)
+target_link_libraries(${PROJECT_NAME}_struct PRIVATE glz_test_common)
+
+if (MINGW)
+    target_compile_options(${PROJECT_NAME}_struct PRIVATE "-Wa,-mbig-obj")
+endif ()
+
+add_test(NAME ${PROJECT_NAME}_struct COMMAND ${PROJECT_NAME}_struct)
+target_code_coverage(${PROJECT_NAME}_struct AUTO ALL)
